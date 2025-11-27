@@ -21,8 +21,8 @@ const geminiApiKey = process.env.GEMINI_API_KEY // Google Gemini API key
 
 // Bot configuration
 const BOT_CONFIG: BotConfig = {
-  host: process.env.MINECRAFT_SERVER_HOST || 'node2.nodenow.eu',
-  port: parseInt(process.env.MINECRAFT_SERVER_PORT || '25696'),
+  host: process.env.MINECRAFT_SERVER_HOST || 'france.elementiamc.xyz',
+  port: parseInt(process.env.MINECRAFT_SERVER_PORT || '2725'),
   username: process.env.MINECRAFT_BOT_USERNAME || 'ice',
   version: process.env.MINECRAFT_VERSION || '1.21.2',
   auth: 'offline' as const,
