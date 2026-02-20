@@ -274,7 +274,8 @@ server.on('error', (error: any) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+const host = process.platform === 'win32' ? 'localhost' : '0.0.0.0';
+server.listen(PORT, host, () => {
   console.log(`✅ Bot Viewer Dashboard đã khởi động thành công!`);
   console.log(`👁️ Truy cập dashboard tại: http://localhost:${PORT}`);
 });

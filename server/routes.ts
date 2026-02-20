@@ -220,7 +220,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Removed spam log - only log on status change
       } catch (importError) {
-        console.log('⚠️ Cannot import bot-status:', importError.message);
+        const errorMessage = importError instanceof Error ? importError.message : String(importError);
+        console.log('⚠️ Cannot import bot-status:', errorMessage);
         realBotStatus = {
           connected: false,
           health: 0,
@@ -246,7 +247,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
           // Removed spam log - only log important changes
         }
       } catch (viewerError) {
-        console.log('⚠️ Cannot fetch viewer data:', viewerError.message);
+        const errorMessage = viewerError instanceof Error ? viewerError.message : String(viewerError);
+        console.log('⚠️ Cannot fetch viewer data:', errorMessage);
       }
 
       // Use viewer data as fallback if bot-status is not connected but viewer has data

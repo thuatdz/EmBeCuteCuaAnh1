@@ -1,4 +1,13 @@
 import 'dotenv/config'
+import { config } from 'dotenv'
+import { fileURLToPath } from 'url'
+import { dirname, join } from 'path'
+
+// Load .env from project root
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+config({ path: join(__dirname, '..', '.env') })
+
 import mineflayer, { Bot } from 'mineflayer'
 import { pathfinder, Movements } from 'mineflayer-pathfinder'
 import * as net from 'net'
@@ -11,23 +20,22 @@ import { plugin as pvp } from 'mineflayer-pvp'
 import { plugin as collectBlock } from 'mineflayer-collectblock'
 const autoEat = require('mineflayer-auto-eat').plugin
 import { Vec3 } from 'vec3'
+import * as fs from 'fs'
 
 // Import các module đã tách
 import { BotConfig, BotState } from './types'
 import { updateBotStatus, setBotConnected, getBotStatus } from './bot-status'
 const { mineflayer: mineflayerViewer } = require('prismarine-viewer')
 
-const geminiApiKey = process.env.GEMINI_API_KEY // Google Gemini API key
+const groqApiKey = process.env.GROQ_API_KEY // Groq API key (Free, Fast LLM)
 
 // Bot configuration
 const BOT_CONFIG: BotConfig = {
-  host: process.env.MINECRAFT_SERVER_HOST || 'france.elementiamc.xyz',
-  port: parseInt(process.env.MINECRAFT_SERVER_PORT || '2725'),
+  host: process.env.MINECRAFT_SERVER_HOST || 'bloom.pikamc.vn',
+  port: parseInt(process.env.MINECRAFT_SERVER_PORT || '25718'),
   username: process.env.MINECRAFT_BOT_USERNAME || 'ice',
-  version: process.env.MINECRAFT_VERSION || '1.21.2',
-  auth: 'offline' as const,
-  skinUrl: process.env.BOT_SKIN_URL || 'https://crafatar.com/skins/f014f08b7402657d', // Skin từ NameMC
-  capeUrl: process.env.BOT_CAPE_URL || undefined
+  version: process.env.MINECRAFT_VERSION || '1.21.4',
+  auth: 'offline' as const
 }
 
 // Export BOT_CONFIG globally for bot-status sync
@@ -60,7 +68,7 @@ const MAX_RECONNECT_ATTEMPTS = 5
 let presenceCheckFailures = 0
 let lastPresenceCheck = Date.now()
 
-// Auto mining variables - RESTORED per user requirements
+// Auto mining variables
 let autoMiningActive = false
 let currentMiningTarget: any = null
 let targetOreType = ''
@@ -68,16 +76,11 @@ let miningInterval: NodeJS.Timeout | null = null
 let lastMinedPosition: any = null
 let isCurrentlyDigging = false
 
-// Auto mining variables - REMOVED but needed for cleanup (replaced by new implementation above)
-
 // Auto eat plugin variables
 let autoEatPluginActive = false // Track trạng thái auto eat plugin
 let lastMobCheckTime = 0 // Track lần cuối kiểm tra mob xung quanh
 
-// Auto mining variables - REMOVED
-// Chức năng auto mining đã được loại bỏ hoàn toàn
-
-// Auto chest hunting variables - RESTORED per user requirements
+// Auto chest hunting variables
 let autoChestHuntingActive = false
 let currentChestTarget: any = null
 let chestHuntingInterval: NodeJS.Timeout | null = null
@@ -89,11 +92,104 @@ let farmInterval: NodeJS.Timeout | null = null // Farm interval for compatibilit
 let autoCropFarmerActive = false
 let cropFarmerInterval: NodeJS.Timeout | null = null
 let currentHoeTool: any = null
+let lastCropFarmLog = 0 // Track lần cuối log để tránh spam
+let lastEquipLog = 0 // Track lần cuối log equip để tránh spam
+
+// Shield blocking variables - NEW
+let isBlockingWithShield = false
+let lastShieldBlockTime = 0
 let harvestedCrops: Set<string> = new Set() // Track harvested crops to avoid re-harvesting
+
+// Authorized players list - NEW
+let authorizedPlayers: string[] = []
+
+// Load authorized players from server.namgt68
+function loadAuthorizedPlayers() {
+  try {
+    const filePath = join(__dirname, '..', 'server.namgt68')
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf-8')
+      authorizedPlayers = content
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'))
+        .map(name => name.toLowerCase())
+      console.log(`✅ Đã tải ${authorizedPlayers.length} người chơi được phép:`, authorizedPlayers)
+    } else {
+      console.log('⚠️ Không tìm thấy file server.namgt68, tất cả người chơi đều có thể điều khiển bot')
+      authorizedPlayers = []
+    }
+  } catch (error) {
+    console.log('❌ Lỗi đọc file server.namgt68:', error)
+    authorizedPlayers = []
+  }
+}
+
+// Calculate string similarity (Levenshtein distance)
+function calculateSimilarity(str1: string, str2: string): number {
+  const s1 = str1.toLowerCase()
+  const s2 = str2.toLowerCase()
+  
+  const len1 = s1.length
+  const len2 = s2.length
+  
+  if (len1 === 0) return len2 === 0 ? 100 : 0
+  if (len2 === 0) return 0
+  
+  const matrix: number[][] = []
+  
+  for (let i = 0; i <= len1; i++) {
+    matrix[i] = [i]
+  }
+  
+  for (let j = 0; j <= len2; j++) {
+    matrix[0][j] = j
+  }
+  
+  for (let i = 1; i <= len1; i++) {
+    for (let j = 1; j <= len2; j++) {
+      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      )
+    }
+  }
+  
+  const distance = matrix[len1][len2]
+  const maxLen = Math.max(len1, len2)
+  const similarity = ((maxLen - distance) / maxLen) * 100
+  
+  return similarity
+}
+
+// Check if player is authorized (98% similarity)
+function isPlayerAuthorized(username: string): boolean {
+  // Nếu không có danh sách, cho phép tất cả
+  if (authorizedPlayers.length === 0) {
+    return true
+  }
+  
+  const cleanUsername = username.toLowerCase().trim()
+  
+  // Kiểm tra độ tương đồng với từng tên trong danh sách
+  for (const authorizedName of authorizedPlayers) {
+    const similarity = calculateSimilarity(cleanUsername, authorizedName)
+    console.log(`🔍 So sánh "${cleanUsername}" với "${authorizedName}": ${similarity.toFixed(2)}%`)
+    
+    if (similarity >= 98) {
+      console.log(`✅ Player "${username}" được phép điều khiển bot (${similarity.toFixed(2)}% khớp)`)
+      return true
+    }
+  }
+  
+  console.log(`❌ Player "${username}" KHÔNG được phép điều khiển bot`)
+  return false
+}
 
 // PVP variables - NEW
 let pvpActive = false
-let pvpProActive = false
 let pvpTargetName = ''
 let pvpInterval: NodeJS.Timeout | null = null
 let hasWarnedWeakPlayer = false // Track nếu đã chat "Sao cậu yếu thế"
@@ -101,13 +197,22 @@ let lastPvpTpAttempt = 0 // Track lần cuối thử /tp trong PVP
 let lastShieldCheck = 0 // Track lần cuối check shield
 let isCirclingBehind = false // Track nếu đang vòng ra sau lưng
 
-// Biến cho respawn handling
-let lastMode = 'idle' // Track chế độ trước khi chết
-let lastPosition: any = null // Track vị trí trước khi chết
-let lastTargetPlayerName = '' // Track tên player đang theo/bảo vệ
-let hasTpPermission: boolean | null = null // Track quyền /tp
-let tpFailCount = 0 // Đếm số lần /tp thất bại
-let lastAttackTime = 0 // Track lần cuối tấn công để cooldown
+// Bow mode variables - NEW
+let bowModeActive = false // Chế độ tấn công tầm xa với cung
+let lastBowShot = 0 // Track lần bắn cuối để cooldown
+
+// AI Agent variables - NEW
+let aiAgentActive = false
+let aiAgentShouldStop = false
+
+  // Biến cho respawn handling
+  let lastMode = 'idle' // Track chế độ trước khi chết
+  let lastPosition: any = null // Track vị trí trước khi chết
+  let lastTargetPlayerName = '' // Track tên player đang theo/bảo vệ
+  let hasTpPermission: boolean | null = null // Track quyền /tp
+  let tpFailCount = 0 // Đếm số lần /tp thất bại
+  let lastAttackTime = 0 // Track lần cuối tấn công để cooldown
+  let lastTpAttempt = 0 // Track lần cuối thử /tp để tránh spam
 
 // Auto Explore variables - NEW
 let autoExploreActive = false
@@ -115,6 +220,12 @@ let exploreInterval: NodeJS.Timeout | null = null
 let exploreDirection: { x: number, z: number } | null = null
 let discoveredStructures: Set<string> = new Set() // Track discovered structures
 let lastExploreMove = 0
+
+// Auto Collect variables - NEW
+let autoCollectActive = false
+let collectInterval: NodeJS.Timeout | null = null
+let spawnPoint: Vec3 | null = null // Lưu vị trí spawn
+let lastCollectLog = 0 // Track để tránh spam log
 
 // Compatibility shims to replace deleted manager modules
 let equipmentManager: any
@@ -136,11 +247,12 @@ let startSmartAutoFishing: () => void
 let stopSmartAutoFishing: () => void
 let startSmartAutoBuild: (buildType: string) => void
 let stopSmartAutoBuild: () => void
-// Auto mining functions removed
-let startAutoFarmAll: () => void
-let stopAutoFarm: () => void
+let equipBestSwordForCombat: () => boolean | undefined
+// Auto mining functions
 let startAutoMining: (oreType: string) => void
 let stopAutoMining: () => void
+let startAutoFarmAll: () => void
+let stopAutoFarm: () => void
 // Auto chest hunting functions
 let startAutoChestHunting: () => void
 let stopAutoChestHunting: () => void
@@ -149,11 +261,14 @@ let startAutoCropFarmer: () => void
 let stopAutoCropFarmer: () => void
 // PVP functions
 let startPvP: (targetName: string) => void
-let startPvPPro: (targetName: string) => void
 let stopPvP: (silent?: boolean) => void
 // Auto Explore functions
 let startAutoExplore: () => void
 let stopAutoExplore: () => void
+// Auto Collect functions
+let startAutoCollect: () => void
+let stopAutoCollect: () => void
+let goHome: () => void
 
 // Create compatibility shims
 function createManagerShims() {
@@ -178,7 +293,7 @@ function createManagerShims() {
     getIsAutoFarmActive: () => autoFarmActive
   }
 
-  // Auto mining manager removed
+  // Auto mining manager - REMOVED COMPLETELY
 
   fishingManager = {
     startSmartAutoFishing: () => startSmartAutoFishing(),
@@ -192,8 +307,8 @@ function createManagerShims() {
   }
 
   autoEatManager = {
-    setup: () => setupAutoEatPlugin(),
-    disable: () => disableAutoEatPlugin()
+    setup: () => {}, // Removed
+    disable: () => {} // Removed
   }
 
   equipmentManager = {
@@ -233,6 +348,9 @@ async function testServerConnection() {
 async function createBot() {
   console.log(`🚀 Đang tạo bot mới... (Thử lần ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`)
   console.log(`📡 Kết nối tới: ${BOT_CONFIG.host}:${BOT_CONFIG.port}`)
+  
+  // Load authorized players list
+  loadAuthorizedPlayers()
 
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
     console.log('❌ Đã vượt quá số lần thử kết nối tối đa. Dừng bot.')
@@ -267,9 +385,7 @@ async function createBot() {
     auth: BOT_CONFIG.auth,
     keepAlive: true,
     checkTimeoutInterval: 60000, // Check connection mỗi 60s
-    hideErrors: false,
-    skinUrl: BOT_CONFIG.skinUrl, // Áp dụng skin từ config
-    capeUrl: BOT_CONFIG.capeUrl   // Áp dụng cape nếu có
+    hideErrors: false
   })
 
   // Tăng MaxListeners để tránh warning
@@ -295,7 +411,7 @@ async function createBot() {
             prismarineViewerInstance.close()
           }
         } catch (cleanupErr) {
-          console.log('⚠️ Error cleaning up old viewer:', cleanupErr.message)
+          console.log('⚠️ Error cleaning up old viewer:', (cleanupErr as Error).message || cleanupErr)
         }
         prismarineViewerInstance = null
       }
@@ -352,7 +468,7 @@ async function createBot() {
                   })
                 }).catch(() => {})
 
-                bot.chat('🎮 3D Viewer đã sẵn sàng!')
+                // Không chat để tránh spam
               })
 
               viewer.on('error', (error: any) => {
@@ -379,7 +495,7 @@ async function createBot() {
                 })
               }).catch(() => {})
 
-              bot.chat('🎮 3D Viewer đã sẵn sàng!')
+              // Không chat để tránh spam
             }
 
             break // Successfully started, exit port loop
@@ -535,13 +651,12 @@ async function createBot() {
   function setupBotEnvironmentTracking() {
     if (!bot) return
 
-    // Track các entities xung quanh
+    // Track các entities xung quanh - REDUCED SPAM
     bot.on('entitySpawn', (entity) => {
       if (entity.type === 'player') {
         console.log(`👤 Player xuất hiện: ${entity.username || entity.displayName || 'Unknown'}`)
-      } else if (entity.type === 'mob') {
-        console.log(`🐾 Mob xuất hiện: ${entity.name || entity.displayName || 'Unknown'}`)
       }
+      // Removed mob spawn log to reduce spam - chỉ log player thôi
     })
 
     // Track block breaks/places - disabled to reduce spam
@@ -576,18 +691,30 @@ async function createBot() {
     console.log('⚠️ Warning loading plugins:', pluginError)
   }
 
+  // Initialize compatibility shims NGAY SAU KHI TẠO BOT để tránh lỗi undefined
+  createManagerShims()
+  console.log('✅ Managers initialized')
+
   // Connection events
   bot.on('login', () => {
-    console.log('🔑 Bot đang đăng nhập...')
+    console.log('🔑 Bot đã đăng nhập thành công!')
+    console.log(`👤 Username: ${bot.username}`)
+    console.log(`🌍 Đang chờ spawn...`)
+  })
+
+  bot.once('inject_allowed', () => {
+    console.log('✅ Bot được phép inject packets')
   })
 
   bot.on('spawn', () => {
     console.log('🎉 Bot đã spawn thành công!')
-    console.log(`🎨 Skin được áp dụng: ${BOT_CONFIG.skinUrl}`)
-    if (BOT_CONFIG.capeUrl) {
-      console.log(`🎪 Cape được áp dụng: ${BOT_CONFIG.capeUrl}`)
-    }
     reconnectAttempts = 0 // Reset on successful connection
+
+    // Lưu spawn point khi bot spawn lần đầu
+    if (!spawnPoint && bot.entity && bot.entity.position) {
+      spawnPoint = bot.entity.position.clone()
+      console.log(`🏠 Đã lưu spawn point: ${Math.floor(spawnPoint.x)}, ${Math.floor(spawnPoint.y)}, ${Math.floor(spawnPoint.z)}`)
+    }
 
     // Reset presence check failures on successful spawn
     presenceCheckFailures = 0
@@ -599,13 +726,12 @@ async function createBot() {
         const defaultMove = new Movements(bot)
         bot.pathfinder.setMovements(defaultMove)
 
-        // Initialize compatibility shims
-        createManagerShims()
+        // Managers đã được khởi tạo sớm hơn, không cần khởi tạo lại
 
         // Start các chức năng với delay
         setTimeout(() => startStatusUpdates(), 1000)
         setTimeout(() => startWebStatusUpdates(), 1500)
-        setTimeout(() => setupAutoEatPlugin(), 2000)
+        // setupAutoEatPlugin removed - using bot.autoEat directly
         setTimeout(() => collectNearbyItems(), 3000)
 
         // Xử lý respawn sau khi bot đã ổn định
@@ -616,6 +742,9 @@ async function createBot() {
 
         // Start monitoring player list to ensure bot is actually in server
         setTimeout(() => startPlayerListMonitoring(), 7000)
+
+        // Kiểm tra quyền /tp một lần duy nhất
+        setTimeout(() => checkTpPermissionOnce(), 8000)
 
         console.log('✅ Bot setup hoàn tất và ổn định')
 
@@ -673,7 +802,7 @@ async function createBot() {
           }
         }
       } catch (error) {
-        console.log('⚠️ Player list monitoring error:', error.message)
+        console.log('⚠️ Player list monitoring error:', (error as Error).message || error)
         playerListCheckFailures++
       }
     }, 15000) // Check every 15 seconds
@@ -688,19 +817,19 @@ async function createBot() {
     // Lưu trạng thái hiện tại
     lastPosition = bot.entity.position ? { ...bot.entity.position } : null
 
-    if (followingManager.getIsFollowing()) {
+    // Kiểm tra managers đã được khởi tạo chưa
+    if (followingManager && followingManager.getIsFollowing()) {
       lastMode = 'following'
       lastTargetPlayerName = followingManager.getTargetPlayerName() || ''
-    } else if (protectingManager.getIsProtecting()) {
+    } else if (protectingManager && protectingManager.getIsProtecting()) {
       lastMode = 'protecting'
       lastTargetPlayerName = protectingManager.getTargetPlayerName() || ''
-    } else if (autoFarmManager.getIsAutoFarmActive()) {
+    } else if (autoFarmManager && autoFarmManager.getIsAutoFarmActive()) {
       lastMode = 'farming'
     } else if (autoCropFarmerActive) {
       lastMode = 'crop_farming'
     } else if (autoFishingActive) {
       lastMode = 'fishing'
-    // Mining mode removed
     } else if (autoChestHuntingActive) {
       lastMode = 'chest_hunting'
     } else {
@@ -715,6 +844,70 @@ async function createBot() {
     // Handle health updates silently
   })
 
+  // ============= TỰ ĐỘNG BƠI VÀ QUẢN LÝ OXY DƯỚI NƯỚC =============
+  let isSwimming = false
+  let lastOxygenCheck = 0
+  let lastSwimLog = 0 // Track để tránh spam log
+  
+  setInterval(() => {
+    try {
+      const currentTime = Date.now()
+      
+      // Kiểm tra mỗi 1000ms (giảm frequency để tránh spam)
+      if (currentTime - lastOxygenCheck < 1000) return
+      lastOxygenCheck = currentTime
+
+      // Kiểm tra xem bot có đang trong nước không
+      const headBlock = bot.blockAt(bot.entity.position.offset(0, 1.6, 0))
+      const isInWater = headBlock && headBlock.name === 'water'
+      
+      if (isInWater) {
+        // Bot đang ở dưới nước
+        
+        // Log chỉ 1 lần mỗi 10 giây để tránh spam
+        if (!isSwimming && currentTime - lastSwimLog > 10000) {
+          console.log(`🏊 Đang bơi dưới nước`)
+          lastSwimLog = currentTime
+          isSwimming = true
+        }
+        
+        // CHỈ BƠI LÊN KHI KHÔNG ĐANG THỰC HIỆN HÀNH ĐỘNG KHÁC
+        // Nếu đang follow/protect, để pathfinder xử lý
+        const isDoingActivity = isFollowing || isProtecting || autoFarmActive || 
+                                autoFishingActive || pvpActive
+        
+        if (!isDoingActivity) {
+          // Chỉ bơi lên khi idle
+          const blockAbove = bot.blockAt(bot.entity.position.offset(0, 2, 0))
+          const hasWaterAbove = blockAbove && blockAbove.name === 'water'
+          
+          if (hasWaterAbove) {
+            // Vẫn còn nước phía trên, bơi lên nhẹ nhàng
+            bot.setControlState('jump', true)
+            bot.setControlState('sprint', true)
+          } else {
+            // Đã gần mặt nước
+            bot.setControlState('jump', false)
+            bot.setControlState('sprint', false)
+          }
+        }
+        // Nếu đang làm việc khác, không can thiệp vào control state
+        
+      } else {
+        // Không còn trong nước
+        if (isSwimming) {
+          bot.setControlState('jump', false)
+          bot.setControlState('sprint', false)
+          isSwimming = false
+          // Không log nữa để tránh spam
+        }
+      }
+      
+    } catch (error) {
+      // Silent error
+    }
+  }, 1000) // Check mỗi 1 giây thay vì 500ms
+
   // Suppress deprecated physicTick warnings from plugins
   const originalConsoleWarn = console.warn
   console.warn = (...args) => {
@@ -724,9 +917,129 @@ async function createBot() {
     }
   }
 
-  // Hàm trang bị KIẾM TỐINHẤT - BẮT BUỘC cho chiến đấu
-  function equipBestSwordForCombat() {
+  // Suppress partial packet warnings (explosion packets)
+  const originalConsoleLog = console.log
+  console.log = (...args) => {
+    const message = args.join(' ')
+    // Bỏ qua warning về partial packet explosion
+    if (message.includes('Chunk size') && message.includes('partial packet') && message.includes('explosion')) {
+      return // Không log
+    }
+    originalConsoleLog.apply(console, args)
+  }
+
+  // ============= HÀM KIỂM TRA VÀ SỬ DỤNG /TP AN TOÀN =============
+  
+  // Kiểm tra quyền /tp một lần duy nhất khi bot spawn
+  async function checkTpPermissionOnce() {
+    if (hasTpPermission !== null) return // Đã check rồi
+    
+    console.log('🔍 Kiểm tra quyền OP/tp...')
+    
     try {
+      // Phương pháp 1: Thử lệnh /gamemode để check OP
+      const currentGamemode = bot.game.gameMode
+      bot.chat('/gamemode survival')
+      
+      // Đợi 1 giây
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      
+      // Nếu không bị kick hoặc báo lỗi permission thì có OP
+      if (bot._client && bot._client.state === 'play') {
+        hasTpPermission = true
+        console.log('✅ Bot có quyền OP (có thể dùng /tp)')
+        
+        // Khôi phục gamemode cũ nếu cần
+        if (currentGamemode !== 'survival') {
+          bot.chat(`/gamemode ${currentGamemode}`)
+        }
+        return
+      }
+    } catch (error) {
+      // Nếu lỗi, thử phương pháp 2
+    }
+    
+    try {
+      // Phương pháp 2: Thử /tp đến chính mình
+      const currentPos = bot.entity.position
+      const testX = Math.floor(currentPos.x)
+      const testY = Math.floor(currentPos.y) + 2
+      const testZ = Math.floor(currentPos.z)
+      
+      bot.chat(`/tp ${bot.username} ${testX} ${testY} ${testZ}`)
+      
+      // Đợi 1.5 giây kiểm tra
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      
+      const newPos = bot.entity.position
+      const moved = Math.abs(newPos.y - currentPos.y) > 1
+      
+      if (moved) {
+        hasTpPermission = true
+        console.log('✅ Bot có quyền /tp (OP)')
+      } else {
+        hasTpPermission = false
+        console.log('❌ Bot KHÔNG có quyền /tp (không phải OP)')
+        console.log('💡 Bot sẽ đào block để di chuyển khi cần thiết')
+      }
+    } catch (error) {
+      hasTpPermission = false
+      console.log('❌ Lỗi kiểm tra /tp, giả định không có quyền')
+    }
+  }
+  
+  // Hàm wrapper an toàn cho /tp - chỉ thực hiện nếu có quyền và không spam
+  function safeTeleport(command: string): boolean {
+    // Kiểm tra quyền
+    if (hasTpPermission === false) {
+      console.log('⚠️ Bỏ qua /tp vì bot không có quyền OP')
+      return false
+    }
+    
+    // Kiểm tra spam (tối đa 1 lần mỗi 3 giây)
+    const now = Date.now()
+    if (now - lastTpAttempt < 3000) {
+      console.log('⚠️ Bỏ qua /tp để tránh spam (cooldown 3s)')
+      return false
+    }
+    
+    // Thực hiện teleport
+    lastTpAttempt = now
+    bot.chat(command)
+    console.log(`📍 Thực hiện: ${command}`)
+    return true
+  }
+  
+  // Hàm tạo movements thông minh - cho phép đào nếu không có OP
+  function createSmartMovements(): any {
+    const movements = new Movements(bot)
+    
+    // Nếu không có OP, cho phép đào block để di chuyển
+    if (hasTpPermission === false) {
+      movements.canDig = true
+      movements.digCost = 1 // Chi phí đào thấp
+      movements.placeCost = 1 // Chi phí đặt block thấp
+      console.log('⛏️ Movements: Cho phép đào block (không có OP)')
+    } else {
+      // Có OP thì không cần đào, dùng /tp
+      movements.canDig = false
+    }
+    
+    movements.allowSprinting = true
+    movements.allowParkour = true
+    movements.allow1by1towers = false
+    
+    return movements
+  }
+
+  // Hàm trang bị KIẾM TỐINHẤT - BẮT BUỘC cho chiến đấu
+  equipBestSwordForCombat = function() {
+    try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return
+      }
+      
       // CHỈ TÌM KIẾM - ưu tiên tuyệt đối cho combat
       const swords = bot.inventory.items().filter(item =>
         item.name.includes('sword')
@@ -773,7 +1086,13 @@ async function createBot() {
           console.log(`🪓 Trang bị rìu thay thế: ${bestAxe.name} cho combat`)
           return true
         }
-        console.log('⚠️ Không có kiếm hoặc rìu để combat!')
+        
+        // Chỉ log 1 lần mỗi 10 giây để tránh spam
+        const now = Date.now()
+        if (now - lastEquipLog > 10000) {
+          console.log('⚠️ Không có kiếm hoặc rìu để combat!')
+          lastEquipLog = now
+        }
         return false
       }
     } catch (error) {
@@ -785,6 +1104,16 @@ async function createBot() {
   // Hàm trang bị công cụ phù hợp khi đi theo (không combat)
   function equipBestToolForFollowing() {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return
+      }
+      
+      // Không đổi công cụ khi đang fishing hoặc farming
+      if (autoFishingActive || autoFarmActive) {
+        return
+      }
+      
       // Khi đi theo, ưu tiên pickaxe > shovel > axe > sword
       const tools = bot.inventory.items().filter(item =>
         item.name.includes('pickaxe') ||
@@ -820,11 +1149,16 @@ async function createBot() {
 
         if (!bot.heldItem || bot.heldItem.name !== bestTool.name) {
           bot.equip(bestTool, 'hand').catch(() => {})
-          console.log(`🔧 Trang bị công cụ theo dõi: ${bestTool.name}`)
+          // Chỉ log 1 lần mỗi 15 giây để tránh spam
+          const now = Date.now()
+          if (now - lastEquipLog > 15000) {
+            console.log(`🔧 Trang bị công cụ theo dõi: ${bestTool.name}`)
+            lastEquipLog = now
+          }
         }
       }
     } catch (error) {
-      console.log('Lỗi trang bị công cụ:', error)
+      // Silent error
     }
   }
 
@@ -869,7 +1203,7 @@ async function createBot() {
           )
 
           if (!isPassable && block.boundingBox === 'block') {
-            console.log(`🚫Vật cản: ${block.name} tại ${checkPoint.x.toFixed(1)}, ${checkPoint.y.toFixed(1)}, ${checkPoint.z.toFixed(1)}`)
+            // Removed spam log - chỉ return false thôi
             return false
           }
         }
@@ -877,47 +1211,153 @@ async function createBot() {
 
       return true // Không có vật cản
     } catch (error) {
-      console.log('⚠️ Lỗi kiểm tra line of sight:', error)
+      // Silent error - không spam log
       return true // Cho phép tấn công nếu có lỗi để tránh block hoàn toàn
     }
   }
 
-  // Hàm tấn công cận chiến SPAM CỰC NHANH - tấn công liên tục không ngừng
+  // Hàm tấn công cận chiến với NHẢY LÊN để tăng sát thương (critical hit)
+  let lastMeleeAttackTime = 0
   function meleeAttack(target: any, distance: number): boolean {
     if (!target || !target.isValid || !target.position) return false
 
+    // Cooldown 500ms giữa các đòn để tránh spam vô ích (Minecraft attack cooldown)
+    const now = Date.now()
+    if (now - lastMeleeAttackTime < 500) return false
+    lastMeleeAttackTime = now
+
     try {
-      // Ngắm mục tiêu trước khi tấn công cận chiến
+      // Ngắm mục tiêu CHÍNH XÁC trước khi tấn công
       const targetPos = target.position.clone()
-      targetPos.y += target.height * 0.5 // Ngắm vào trung tâm để chính xác hơn
+      
+      // Tính khoảng cách 3D (bao gồm cả Y axis)
+      const dx = targetPos.x - bot.entity.position.x
+      const dy = targetPos.y - bot.entity.position.y
+      const dz = targetPos.z - bot.entity.position.z
+      const distance3D = Math.sqrt(dx * dx + dy * dy + dz * dz)
+      
+      // Ngắm vào trung tâm body (chest level) để chính xác hơn
+      targetPos.y += target.height * 0.6
+      
+      // Ngắm CHẬM HƠN để chính xác (force = true)
+      bot.lookAt(targetPos, true)
 
-      // Đảm bảo không nhìn xuống đất trong cận chiến
-      const botEyeY = bot.entity.position.y + 1.6
-      if (targetPos.y < botEyeY - 0.8) {
-        targetPos.y = botEyeY - 0.5
-      }
+      // Chờ 50ms để aim ổn định trước khi tấn công
+      setTimeout(() => {
+        if (!target.isValid) return
 
-      // Ngắm cực nhanh
-      bot.lookAt(targetPos, false)
-
-      // Tấn công - giảm xuống để tránh spam
-      for (let i = 0; i < 3; i++) {
-        bot.attack(target)
-      }
+        // NHẢY LÊN để tấn công critical (tăng 50% damage)
+        if (distance3D <= 4 && bot.entity.onGround) {
+          // Nhảy lên để chuẩn bị critical hit
+          bot.setControlState('jump', true)
+          setTimeout(() => {
+            bot.setControlState('jump', false)
+          }, 50)
+          
+          // Tấn công khi đang rơi xuống (critical hit)
+          setTimeout(() => {
+            if (target.isValid) {
+              bot.attack(target)
+            }
+          }, 150)
+        } else {
+          // Tấn công bình thường
+          bot.attack(target)
+        }
+      }, 50)
 
       // Bật sprint để tăng damage và tốc độ
       bot.setControlState('sprint', true)
 
-      // Tấn công spam (đã loại bỏ log để tránh spam console)
       return true
     } catch (error) {
-      console.log('❌ Lỗi tấn công cận chiến:', error)
+      // Silent error để tránh spam
+      return false
+    }
+  }
+
+  // Hàm bắn cung tầm xa CỰC CHUẨN
+  async function bowAttack(target: any, distance: number): Promise<boolean> {
+    if (!target || !target.isValid || !target.position) return false
+
+    // Cooldown 1 giây giữa các mũi tên
+    const now = Date.now()
+    if (now - lastBowShot < 1000) return false
+
+    try {
+      // Trang bị cung nếu chưa có
+      const bow = bot.inventory.items().find(item => 
+        item.name === 'bow' || item.name === 'crossbow'
+      )
+      
+      if (!bow) {
+        console.log('⚠️ Không có cung để bắn!')
+        return false
+      }
+
+      // Trang bị cung
+      if (!bot.heldItem || bot.heldItem.name !== bow.name) {
+        await bot.equip(bow, 'hand')
+      }
+
+      // Kiểm tra có mũi tên không
+      const arrow = bot.inventory.items().find(item => 
+        item.name === 'arrow' || item.name === 'spectral_arrow' || item.name === 'tipped_arrow'
+      )
+      
+      if (!arrow) {
+        console.log('⚠️ Hết mũi tên!')
+        return false
+      }
+
+      // Tính toán vị trí bắn CỰC CHUẨN
+      const targetPos = target.position.clone()
+      
+      // Dự đoán vị trí target sẽ di chuyển đến (lead shot)
+      if (target.velocity) {
+        const timeToHit = distance / 45 // Arrow speed ~45 m/s
+        targetPos.x += target.velocity.x * timeToHit
+        targetPos.y += target.velocity.y * timeToHit
+        targetPos.z += target.velocity.z * timeToHit
+      }
+      
+      // Ngắm vào chest level + bù trọng lực
+      const gravity = 0.05 // Minecraft arrow gravity
+      const timeToTarget = distance / 45
+      const dropCompensation = 0.5 * gravity * timeToTarget * timeToTarget * 20 // Bù rơi
+      
+      targetPos.y += target.height * 0.6 + dropCompensation
+
+      // Ngắm CỰC CHUẨN với force = true
+      await bot.lookAt(targetPos, true)
+
+      // Chờ 100ms để aim ổn định
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      // Kéo cung đầy (1 giây)
+      bot.activateItem() // Bắt đầu kéo cung
+      
+      await new Promise(resolve => setTimeout(resolve, 1000)) // Kéo đầy
+      
+      bot.deactivateItem() // Bắn!
+
+      lastBowShot = now
+      console.log(`🏹 Bắn mũi tên vào ${target.username || target.name} (${distance.toFixed(1)}m)`)
+
+      return true
+    } catch (error) {
+      console.log('❌ Lỗi bắn cung:', (error as any)?.message || error)
       return false
     }
   }
 
   async function equipBestArmor() {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return
+      }
+      
       const armorSlots: {[key: string]: any} = {
         head: null,
         torso: null,
@@ -998,6 +1438,11 @@ async function createBot() {
 
   async function equipBestTool() {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return false
+      }
+      
       const pickaxes = bot.inventory.items().filter(item => item.name.includes('pickaxe'))
 
       if (pickaxes.length > 0) {
@@ -1029,6 +1474,11 @@ async function createBot() {
 
   function equipOffhand() {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return
+      }
+      
       const totem = bot.inventory.items().find(item => item.name === 'totem_of_undying')
       const shield = bot.inventory.items().find(item => item.name.includes('shield'))
 
@@ -1061,42 +1511,28 @@ async function createBot() {
     // Đợi 3 giây để bot ổn định sau khi respawn
     setTimeout(async () => {
       try {
-        // Kiểm tra quyền /tp nếu chưa biết
-        if (hasTpPermission === null) {
-          console.log('🔍 Kiểm tra quyền /tp...')
-          const currentPos = bot.entity.position
-          bot.chat(`/tp ${bot.username} ${Math.floor(currentPos.x)} ${Math.floor(currentPos.y + 1)} ${Math.floor(currentPos.z)}`)
-
-          // Kiểm tra sau 2 giây
-          setTimeout(() => {
-            const newPos = bot.entity.position
-            const moved = Math.abs(newPos.y - currentPos.y) > 0.5
-
-            if (moved) {
-              hasTpPermission = true
-              console.log('✅ Bot có quyền /tp')
-              // Thực hiện teleport về vị trí cũ
-              performRespawnTeleport()
-            } else {
-              hasTpPermission = false
-              tpFailCount++
-              console.log('❌ Bot không có quyền /tp')
-              bot.chat('🥺 Tớ không có quyền /tp để quay lại vị trí cũ. Dừng hoạt động!')
-              resetRespawnState()
-            }
-          }, 2000)
-        } else if (hasTpPermission === true) {
+        // Kiểm tra quyền /tp
+        if (hasTpPermission === false) {
+          console.log('❌ Bỏ qua respawn vì không có quyền /tp')
+          bot.chat('🥺 Tớ không có quyền /tp để quay lại vị trí cũ')
+          resetRespawnState()
+          return
+        }
+        
+        if (hasTpPermission === true) {
           // Có quyền /tp, thực hiện ngay
           performRespawnTeleport()
         } else {
-          // Không có quyền /tp
-          tpFailCount++
-          if (tpFailCount >= 3) {
-            bot.chat('🥺 Tớ không có quyền /tp. Dừng tất cả hoạt động!')
-            resetRespawnState()
-            return
-          }
-          console.log('❌ Bỏ qua respawn vì không có quyền /tp')
+          // Chưa biết, đợi check xong
+          console.log('⏳ Đợi kiểm tra quyền /tp...')
+          setTimeout(() => {
+            if (hasTpPermission === true) {
+              performRespawnTeleport()
+            } else {
+              console.log('❌ Không có quyền /tp, bỏ qua respawn')
+              resetRespawnState()
+            }
+          }, 3000)
         }
       } catch (error) {
         console.log('❌ Lỗi khi kiểm tra quyền /tp:', error)
@@ -1110,7 +1546,13 @@ async function createBot() {
 
     console.log(`🚀 Teleport về vị trí cũ: ${Math.floor(lastPosition.x)}, ${Math.floor(lastPosition.y)}, ${Math.floor(lastPosition.z)}`)
     const tpCommand = `/tp ${bot.username} ${Math.floor(lastPosition.x)} ${Math.floor(lastPosition.y)} ${Math.floor(lastPosition.z)}`
-    bot.chat(tpCommand)
+    
+    // Sử dụng safeTeleport thay vì bot.chat trực tiếp
+    if (!safeTeleport(tpCommand)) {
+      console.log('❌ Không thể teleport, bỏ qua respawn')
+      resetRespawnState()
+      return
+    }
 
     // Kiểm tra thành công sau 3 giây
     setTimeout(() => {
@@ -1125,14 +1567,8 @@ async function createBot() {
         console.log('✅ Teleport thành công, khôi phục chế độ')
         restorePreviousMode()
       } else {
-        console.log('❌ Teleport thất bại, thử lại...')
-        tpFailCount++
-        if (tpFailCount < 3) {
-          setTimeout(() => performRespawnTeleport(), 2000)
-        } else {
-          console.log('❌ Teleport thất bại quá nhiều lần, dừng khôi phục')
-          resetRespawnState()
-        }
+        console.log('❌ Teleport thất bại, dừng khôi phục')
+        resetRespawnState()
       }
     }, 3000)
   }
@@ -1170,8 +1606,6 @@ async function createBot() {
         fishingManager.startSmartAutoFishing()
         break
 
-      // Mining mode removed
-
       case 'chest_hunting':
         bot.chat('🔄 Quay lại auto tìm rương!')
         startAutoChestHunting()
@@ -1196,6 +1630,11 @@ async function createBot() {
   // Hàm trang bị vũ khí tốt nhất
   function equipBestWeapon() {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return
+      }
+      
       // Tìm vũ khí tốt nhất theo thứ tự: sword > axe > bow
       const weapons = bot.inventory.items().filter(item =>
         item.name.includes('sword') ||
@@ -1248,185 +1687,87 @@ async function createBot() {
     equipOffhand()
   }, 15000) // Tăng lên 15 giây vì plugin tự xử lý việc ăn
 
-  // ------------------ Auto eat plugin ------------------
-  function setupAutoEatPlugin() {
-    console.log('🍽️ Khởi tạo Auto Eat Plugin - Chỉ ăn khi đói < 6 và an toàn!')
+  // ------------------ Auto eat plugin - REMOVED (using manual eating only) ------------------
+  // setupAutoEatPlugin removed due to API incompatibility
 
-    // Kiểm tra xem bot.autoEat có tồn tại không
-    if (!bot.autoEat) {
-      console.log('⚠️ Auto eat plugin không khả dụng, sử dụng manual eating')
-      autoEatPluginActive = false
-      setupManualEating()
-      return
-    }
-
-    console.log('✅ Auto eat plugin đã hoạt động!')
-    autoEatPluginActive = true
-
-    try {
-      // Cấu hình auto eat plugin
-      bot.autoEat.options = {
-        priority: 'foodPoints', // Ưu tiên theo điểm thức ăn
-        startAt: 6, // Bắt đầu ăn khi food < 6 (3 đùi)
-        bannedFood: [
-          // Loại bỏ thức ăn có hiệu ứng độc
-          'spider_eye', 'poisonous_potato', 'pufferfish', 'raw_chicken',
-          'rotten_flesh', 'suspicious_stew'
-        ],
-        // Chỉ ăn những thức ăn an toàn không gây hiệu ứng độc
-        allowedFood: [
-          'bread', 'apple', 'cooked_beef', 'cooked_pork', 'cooked_chicken',
-          'cooked_salmon', 'cooked_cod', 'baked_potato', 'carrot',
-          'golden_apple', 'enchanted_golden_apple', 'cooked_mutton',
-          'cookie', 'melon_slice', 'sweet_berries', 'honey_bottle',
-          'milk_bucket', 'mushroom_stew', 'rabbit_stew', 'beetroot_soup'
-        ],
-        timeout: 3000 // Timeout 3 giây cho việc ăn
-      }
-
-      // Event listener khi bắt đầu ăn
-      bot.on('autoeat_started', (item: any) => {
-        console.log(`🍞 Auto eat bắt đầu ăn: ${item.name} - Food hiện tại: ${bot.food}/20`)
-        isEating = true
-      })
-
-      // Event listener khi ăn xong
-      bot.on('autoeat_finished', (item: any) => {
-        console.log(`✅ Auto eat hoàn thành: ${item.name} - Food hiện tại: ${bot.food}/20`)
-        isEating = false
-
-        // Trang bị lại công cụ mining sau khi ăn nếu đang mine
-        if (autoMiningActive) {
-          setTimeout(() => {
-            equipBestPickaxe()
-          }, 500)
-        } else if (!isBlockedByFishing()) {
-          setTimeout(() => {
-            equipBestWeapon()
-          }, 500)
-        }
-      })
-
-      // Event listener khi lỗi ăn
-      bot.on('autoeat_error', (error: any) => {
-        console.log('⚠️ Auto eat lỗi:', error.message)
-        isEating = false
-      })
-
-      // Kiểm tra mob xung quanh mỗi 2 giây - chỉ ăn khi an toàn
-      setInterval(() => {
-        if (!autoEatPluginActive || !bot.autoEat) return
-
-        const currentTime = Date.now()
-        if (currentTime - lastMobCheckTime < 2000) return // Chỉ check mỗi 2 giây
-        lastMobCheckTime = currentTime
-
-        const food = bot.food
-
-        // Chỉ kiểm tra khi thực sự cần ăn
-        if (food >= 6) {
-          // Đủ no, tắt auto eat
-          if (bot.autoEat.isEnabled && bot.autoEat.isEnabled()) {
-            bot.autoEat.disable()
-          }
-          return
-        }
-
-        // Quét mob xung quanh 4 blocks - chỉ khi không đang mine
-        if (!autoMiningActive) {
-          const nearbyMobs = Object.values(bot.entities).filter((entity: any) => {
-            if (!entity || !entity.position) return false
-            if (entity.type !== 'mob') return false
-            if (entity.name?.includes('villager') || entity.name?.includes('iron_golem')) return false
-
-            const distance = bot.entity.position.distanceTo(entity.position)
-            return distance <= 4
-          })
-
-          if (nearbyMobs.length === 0) {
-            // An toàn, bật auto eat
-            if (bot.autoEat.isEnabled && !bot.autoEat.isEnabled() && food < 6) {
-              bot.autoEat.enable()
-              console.log('🍽️ Vùng an toàn - Bật auto eat (Food:', food, '/20)')
-            }
-          } else {
-            // Có mob gần, tắt auto eat để tập trung chiến đấu
-            if (bot.autoEat.isEnabled && bot.autoEat.isEnabled()) {
-              bot.autoEat.disable()
-              console.log('⚔️ Có mob gần - Tạm tắt auto eat để combat')
-            }
-          }
-        } else {
-          // Đang mine - luôn cho phép ăn khi cần
-          if (bot.autoEat.isEnabled && !bot.autoEat.isEnabled() && food < 6) {
-            bot.autoEat.enable()
-            console.log('⛏️ Mine mode - Bật auto eat (Food:', food, '/20)')
-          }
-        }
-      }, 2000) // Check mỗi 2 giây
-
-      console.log('🍽️ Auto eat plugin setup hoàn tất!')
-    } catch (error) {
-      console.log('❌ Lỗi setup auto eat plugin:', error.message)
-      autoEatPluginActive = false
-      setupManualEating()
-    }
-  }
-
-  // Backup manual eating system
+  // Backup manual eating system - LUÔN HOẠT ĐỘNG
   function setupManualEating() {
-    console.log('🍽️ Khởi tạo Manual Eating System')
+    console.log('🍽️ Khởi tạo Manual Eating System - Luôn hoạt động!')
 
     setInterval(() => {
-      if (autoEatPluginActive || isEating) return
+      // Không check autoEatPluginActive nữa - luôn chạy
+      if (isEating) return // Chỉ skip nếu đang ăn
 
       const food = bot.food
-      if (food < 6) { // Chỉ ăn khi đói < 6
-        const safeFood = bot.inventory.items().find(item => {
-          const name = item.name.toLowerCase()
-          const safeItems = [
-            'bread', 'apple', 'cooked_beef', 'cooked_pork', 'cooked_chicken',
-            'cooked_salmon', 'cooked_cod', 'baked_potato', 'carrot',
-            'golden_apple', 'enchanted_golden_apple', 'cooked_mutton',
-            'cookie', 'melon_slice', 'sweet_berries'
-          ]
-          return safeItems.some(safe => name.includes(safe))
-        })
+      
+      // Chat cảnh báo khi đói < 2 đùi (4 food points)
+      if (food < 4 && food > 0) {
+        const currentTime = Date.now()
+        // Chỉ chat 1 lần mỗi 30 giây để tránh spam
+        if (currentTime - lastEatTime > 30000) {
+          bot.chat('🥺 Đói dthương nhé')
+          lastEatTime = currentTime
+        }
+      }
+      
+      // Chỉ ăn khi đói < 6 (3 đùi) VÀ không đang thực hiện hành động nào
+      if (food < 6) {
+        // Kiểm tra xem bot có đang thực hiện hành động không
+        const isIdle = !isFollowing && 
+                       !isProtecting && 
+                       !autoFarmActive && 
+                       !autoFishingActive && 
+                       !autoMiningActive && 
+                       !autoCropFarmerActive && 
+                       !autoChestHuntingActive &&
+                       !pvpActive
+        
+        // Chỉ ăn khi IDLE (không làm gì)
+        if (isIdle) {
+          const safeFood = bot.inventory.items().find(item => {
+            const name = item.name.toLowerCase()
+            const safeItems = [
+              'bread', 'apple', 'cooked_beef', 'cooked_pork', 'cooked_chicken',
+              'cooked_salmon', 'cooked_cod', 'baked_potato', 'carrot',
+              'golden_apple', 'enchanted_golden_apple', 'cooked_mutton',
+              'cookie', 'melon_slice', 'sweet_berries'
+            ]
+            return safeItems.some(safe => name.includes(safe))
+          })
 
-        if (safeFood) {
-          isEating = true
-          console.log(`🍞 Manual eating: ${safeFood.name}`)
+          if (safeFood) {
+            isEating = true
+            console.log(`🍞 Manual eating (IDLE mode): ${safeFood.name}`)
 
-          bot.equip(safeFood, 'hand').then(() => {
-            bot.consume().then(() => {
-              console.log(`✅ Đã ăn ${safeFood.name}`)
-              isEating = false
-
-              // Trang bị lại công cụ sau khi ăn
-              if (autoMiningActive) {
-                setTimeout(() => equipBestPickaxe(), 500)
-              } else if (!isBlockedByFishing()) {
-                setTimeout(() => equipBestWeapon(), 500)
-              }
+            bot.equip(safeFood, 'hand').then(() => {
+              bot.consume().then(() => {
+                console.log(`✅ Đã ăn ${safeFood.name}`)
+                isEating = false
+              }).catch(() => {
+                isEating = false
+              })
             }).catch(() => {
               isEating = false
             })
-          }).catch(() => {
-            isEating = false
-          })
+          } else if (food < 6) {
+            // Không có đồ ăn và đang đói - chat cảnh báo
+            const currentTime = Date.now()
+            // Chỉ chat 1 lần mỗi 60 giây để tránh spam
+            if (currentTime - lastEatTime > 60000) {
+              bot.chat('🥺 Không có đồ ăn trong túi, đói quá!')
+              console.log('⚠️ Không có đồ ăn an toàn trong inventory!')
+              lastEatTime = currentTime
+            }
+          }
+        } else {
+          // Đang thực hiện hành động - không ăn
+          // console.log('⏸️ Đang bận, không ăn')
         }
       }
     }, 3000) // Check mỗi 3 giây
   }
 
-  // Hàm tắt auto eat plugin
-  function disableAutoEatPlugin() {
-    if (autoEatPluginActive && bot.autoEat) {
-      bot.autoEat.disable()
-      autoEatPluginActive = false
-      console.log('⏹️ Auto eat plugin đã tắt')
-    }
-  }
+  // disableAutoEatPlugin removed - not needed
 
   // ------------------ Nhặt item ------------------
   let itemCollectionDisabled = false // Biến để tắt nhặt đồ khi dừng
@@ -1465,25 +1806,41 @@ async function createBot() {
   // Theo dõi khi item entities spawn để lưu metadata
   bot.on('entitySpawn', (entity: any) => {
     // Chỉ quan tâm đến item entities
-    if (entity.name === 'item' && entity.metadata) {
+    if (entity.name === 'item' || entity.type === 'object') {
       try {
-        // Lấy thông tin item từ metadata
-        const itemStack = entity.metadata.item
-        if (itemStack && itemStack.itemId !== undefined) {
-          // Tra cứu tên item từ registry bằng itemId
-          const itemInfo = bot.registry.items[itemStack.itemId]
-          if (itemInfo) {
-            // Lưu vào Map với entity ID làm key
-            itemEntityMap.set(entity.id, {
-              id: itemStack.itemId,
-              count: itemStack.itemCount || 1,
-              name: itemInfo.name,
-              displayName: itemInfo.displayName || itemInfo.name,
-              spawnTime: Date.now()
-            })
-
-            console.log(`📋 Item spawned: ${itemInfo.name} x${itemStack.itemCount || 1} (entity ${entity.id})`)
+        // Thử lấy metadata ngay lập tức
+        const tryGetMetadata = () => {
+          if (!entity.metadata) return false
+          
+          const itemStack = entity.metadata.item || entity.metadata[7] || entity.metadata[8]
+          if (itemStack && itemStack.itemId !== undefined) {
+            const itemInfo = bot.registry.items[itemStack.itemId]
+            if (itemInfo) {
+              itemEntityMap.set(entity.id, {
+                id: itemStack.itemId,
+                count: itemStack.itemCount || 1,
+                name: itemInfo.name,
+                displayName: itemInfo.displayName || itemInfo.name,
+                spawnTime: Date.now()
+              })
+              // Không log nữa để tránh spam - chỉ log khi nhặt
+              return true
+            }
           }
+          return false
+        }
+
+        // Thử ngay lập tức
+        if (!tryGetMetadata()) {
+          // Nếu không có metadata ngay, đợi một chút rồi thử lại
+          setTimeout(() => {
+            tryGetMetadata()
+          }, 100)
+          
+          // Thử lần cuối sau 500ms
+          setTimeout(() => {
+            tryGetMetadata()
+          }, 500)
         }
       } catch (error) {
         // Bỏ qua lỗi parsing metadata
@@ -1501,6 +1858,33 @@ async function createBot() {
     }
   }, 30000) // Cleanup mỗi 30 giây
 
+  // Lắng nghe metadata updates cho item entities
+  bot.on('entityUpdate', (entity: any) => {
+    if ((entity.name === 'item' || entity.type === 'object') && !itemEntityMap.has(entity.id)) {
+      // Nếu item chưa có trong Map, thử lấy metadata
+      try {
+        if (entity.metadata) {
+          const itemStack = entity.metadata.item || entity.metadata[7] || entity.metadata[8]
+          if (itemStack && itemStack.itemId !== undefined) {
+            const itemInfo = bot.registry.items[itemStack.itemId]
+            if (itemInfo) {
+              itemEntityMap.set(entity.id, {
+                id: itemStack.itemId,
+                count: itemStack.itemCount || 1,
+                name: itemInfo.name,
+                displayName: itemInfo.displayName || itemInfo.name,
+                spawnTime: Date.now()
+              })
+              // Không log nữa để tránh spam - chỉ log khi nhặt
+            }
+          }
+        }
+      } catch (error) {
+        // Bỏ qua lỗi
+      }
+    }
+  })
+
   // Track khi bot nhặt item - ENHANCED VERSION
   bot.on('playerCollect', (collector: any, collected: any) => {
     if (collector.username === bot.username) {
@@ -1516,25 +1900,45 @@ async function createBot() {
         // Xóa khỏi Map sau khi sử dụng
         itemEntityMap.delete(collected.id)
 
-        console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount} (từ Map)`)
+        console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount}`)
         return
       }
 
       // PHƯƠNG PHÁP 2: Thử lấy từ metadata hiện tại
-      if (collected.metadata && collected.metadata.item) {
-        const itemStack = collected.metadata.item
-        if (itemStack.itemId !== undefined) {
+      if (collected.metadata) {
+        const itemStack = collected.metadata.item || collected.metadata[7] || collected.metadata[8]
+        if (itemStack && itemStack.itemId !== undefined) {
           const itemInfo = bot.registry.items[itemStack.itemId]
           if (itemInfo) {
             itemName = itemInfo.displayName || itemInfo.name
             itemCount = itemStack.itemCount || 1
-            console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount} (từ metadata)`)
+            console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount}`)
             return
           }
         }
       }
 
-      // PHƯƠNG PHÁP 3: Fallback methods
+      // PHƯƠNG PHÁP 3: Thử tìm entity trong danh sách entities
+      try {
+        const entity = bot.entities[collected.id]
+        if (entity && entity.metadata) {
+          const metadata = entity.metadata as any
+          const itemStack = metadata.item || metadata[7] || metadata[8]
+          if (itemStack && itemStack.itemId !== undefined) {
+            const itemInfo = bot.registry.items[itemStack.itemId]
+            if (itemInfo) {
+              itemName = itemInfo.displayName || itemInfo.name
+              itemCount = itemStack.itemCount || 1
+              console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount}`)
+              return
+            }
+          }
+        }
+      } catch (e) {
+        // Bỏ qua lỗi
+      }
+
+      // PHƯƠNG PHÁP 4: Fallback methods từ collected object
       if (collected.metadata && collected.metadata.itemName) {
         itemName = collected.metadata.itemName
       } else if (collected.name && collected.name !== 'item') {
@@ -1551,31 +1955,20 @@ async function createBot() {
         itemName = itemName.split(':').pop() || itemName
       }
 
-      // Log với tên đã được cải thiện
-      console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount} (fallback)`)
-    }
-  })
-
-  // Backup method: Listen for inventory changes để track items được nhặt
-  bot.on('windowUpdate', (slot: number, oldItem: any, newItem: any) => {
-    // Chỉ track khi có item mới được thêm vào inventory
-    if (newItem && !oldItem && slot >= 9 && slot <= 44) { // Slots của main inventory
-      let itemName = newItem.name || 'unknown_item'
-
-      // Cải thiện tên hiển thị
-      if (newItem.displayName) {
-        itemName = newItem.displayName
-      } else if (newItem.name) {
-        // Convert technical name thành display name
-        itemName = newItem.name.replace(/_/g, ' ')
+      // Format tên item đẹp hơn nếu vẫn là technical name
+      if (itemName.includes('_')) {
+        itemName = itemName.replace(/_/g, ' ')
           .split(' ')
           .map((word: string) => word.charAt(0).toUpperCase() + word.slice(1))
           .join(' ')
       }
 
-      console.log(`📦 Inventory updated: +${itemName} x${newItem.count} (slot ${slot})`)
+      // Log với tên đã được cải thiện
+      console.log(`🎁 Bot đã nhận: ${itemName} x${itemCount}`)
     }
   })
+
+  // Backup method removed - windowUpdate not in BotEvents
 
   // ------------------ Random Status Updates ------------------
   function startStatusUpdates() {
@@ -1894,9 +2287,9 @@ async function createBot() {
           (hookEntity.position.z - lastHookPosition.z) ** 2
         )
 
-        // Log debug mỗi 2 giây (bớt spam)
-        if (fishingDuration % 2000 < 100) {
-          console.log(`🎣 DEBUG: Y: ${yChange.toFixed(3)}, Dist: ${distanceMoved.toFixed(3)}, Time: ${(fishingDuration/1000).toFixed(1)}s, Sounds: ${bobberThrowCount}`)
+        // Log debug mỗi 10 giây (giảm spam)
+        if (fishingDuration % 10000 < 100) {
+          console.log(`🎣 Đang câu... ${(fishingDuration/1000).toFixed(0)}s`)
         }
 
         // ĐẾM CÁC DẤU HIỆU CÁ CẮN (chỉ sau 6 giây) - THÔNG SỐ TỐI ƯU
@@ -2004,12 +2397,9 @@ async function createBot() {
       const fishingDuration = Date.now() - fishingStartTime
       if (fishingDuration < 4000) return // Chỉ listen sau 4 giây
 
-      // Console để debug âm thanh (nhưng không log fishing_bobber.throw để giảm spam)
-      if (!sound.includes('entity.fishing_bobber.throw') &&
-          !sound.includes('.step') &&
-          !sound.includes('.converted') &&
-          !sound.includes('.aggro')) {
-        console.log(`🔊 Heard sound: ${sound}, position:`, position)
+      // Console để debug âm thanh - CHỈ LOG QUAN TRỌNG
+      if (sound.includes('entity.fishing_bobber.splash')) {
+        console.log(`🔊 Splash sound detected`)
       }
 
       // Đếm số lần âm thanh fishing_bobber.throw xuất hiện
@@ -2060,10 +2450,8 @@ async function createBot() {
         )
 
         if (distance < 3) {
-          // CHỈ LOG ĐỂ THEO DÕI - KHÔNG RÚT CẦN
-          if (particle.name && (particle.name.includes('splash') || particle.name.includes('fishing'))) {
-            console.log(`🌊 Particle ${particle.name} gần phao (${distance.toFixed(2)}m) - chờ âm thanh...`)
-          }
+          // CHỈ LOG ĐỂ THEO DÕI - KHÔNG RÚT CẦN (BỎ LOG ĐỂ GIẢM SPAM)
+          // Particle detected but waiting for sound confirmation
         }
       }
     }
@@ -2710,7 +3098,7 @@ async function createBot() {
             await new Promise(resolve => setTimeout(resolve, 200))
 
           } catch (error) {
-            console.log(`⚠️ Lỗi đặt ${blockType} tại ${pos.x},${pos.y},${pos.z}:`, error.message || error)
+            console.log(`⚠️ Lỗi đặt ${blockType} tại ${pos.x},${pos.y},${pos.z}:`, (error as Error).message || error)
           }
         }
       }
@@ -2844,7 +3232,7 @@ async function createBot() {
             }
           } catch (error) {
             // Bỏ qua lỗi clear terrain
-            console.log(`⚠️ Bỏ qua block tại ${x},${y},${z}:`, error.message)
+            console.log(`⚠️ Bỏ qua block tại ${x},${y},${z}:`, (error as Error).message || error)
           }
         }
       }
@@ -2868,207 +3256,248 @@ async function createBot() {
   }
 
   // ------------------ AUTO CHEST HUNTING - NEW IMPLEMENTATION (Per User Requirements) ------------------
-  // Main function to start auto chest hunting
+  // Main function to start auto chest hunting - VÒNG LẶP
   startAutoChestHunting = async function() {
-    // 1. Kiểm tra pickaxe trước khi bắt đầu
+    // Kiểm tra pickaxe
     const hasPickaxe = bot.inventory.items().some(item => item.name.includes('pickaxe'))
 
     if (!hasPickaxe) {
       bot.chat('🥺 Không có pickaxe! Không thể tìm rương!')
-      console.log('❌ No pickaxe found, stopping all actions')
-      stopAll()
+      console.log('❌ No pickaxe found')
       return
     }
 
-  // Stop other activities
-  stopFollowing()
-  stopProtecting()
-  if (autoFishingActive) stopSmartAutoFishing()
-  if (autoFarmActive) stopAutoFarm()
-  if (autoMiningActive) stopAutoMining(true)
+    // Stop other activities
+    stopFollowing()
+    stopProtecting()
+    if (autoFishingActive) stopSmartAutoFishing()
+    if (autoFarmActive) stopAutoFarm()
+    if (autoMiningActive) stopAutoMining()
+    if (autoCropFarmerActive) stopAutoCropFarmer()
 
     autoChestHuntingActive = true
-    bot.chat('📦 Bắt đầu auto tìm rương! Tớ sẽ quét trong phạm vi 200 blocks...')
-    console.log('📦 Auto Chest Hunting - Activated (200 block radius)')
+    bot.chat('📦 Bắt đầu tìm rương! Đào → Loot → Lặp lại!')
+    console.log('📦 Auto Chest Hunting - Activated (Loop mode)')
 
-    // Clear existing interval if any
-    if (chestHuntingInterval) clearInterval(chestHuntingInterval)
-
-    chestHuntingInterval = setInterval(async () => {
-      if (!autoChestHuntingActive) {
-        clearInterval(chestHuntingInterval!)
-        chestHuntingInterval = null
-        return
+    // Chạy vòng lặp
+    const runLoop = async () => {
+      while (autoChestHuntingActive) {
+        try {
+          await executeChestHuntingCycle()
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        } catch (error) {
+          console.log('❌ Lỗi chest hunting:', error)
+          await new Promise(resolve => setTimeout(resolve, 3000))
+        }
       }
+    }
 
-      try {
-        // Execute chest hunting cycle (similar to mining cycle)
-        await executeChestHuntingCycle()
-      } catch (error) {
-        console.log('❌ Lỗi auto chest hunting:', error)
-        bot.pathfinder.setGoal(null)
-      }
-    }, 2000) // Kiểm tra mỗi 2 giây như yêu cầu
+    runLoop()
   }
 
-  // Hàm thực hiện một chu kỳ tìm rương theo yêu cầu user
+  // Chu kỳ tìm rương: TÌM → ĐÀO ĐẾN → LOOT → LẶP LẠI
   async function executeChestHuntingCycle() {
-    // Check if chest hunting is still active
-    if (!autoChestHuntingActive) {
-      console.log('⏹️ Chest hunting stopped, exiting cycle')
-      return
-    }
+    if (!autoChestHuntingActive) return
 
-    // Bỏ qua nếu đang di chuyển đến rương
-    if (isCurrentlyApproachingChest) {
-      return
-    }
-
-    // Tìm block rương - sử dụng bot.findBlock() như auto mine
+    // Tìm rương gần nhất với khoảng cách lớn hơn
     const chestBlock = bot.findBlock({
       matching: (block: any) => {
-        if (!block) return false
-        // Chỉ tìm rương ở y < 40 theo yêu cầu user
-        if (block.position.y >= 40) return false
-        // Tìm các loại rương trong Minecraft
-        return block.name.includes('chest') ||
-               block.name.includes('barrel') ||
-               block.name.includes('shulker_box')
+        if (!block || !block.position) return false
+        if (block.position.y >= 40) return false // Chỉ tìm dưới y=40
+        return block.name && (
+          block.name.includes('chest') ||
+          block.name.includes('barrel') ||
+          block.name.includes('shulker_box')
+        )
       },
-      maxDistance: 200, // Phạm vi 200 blocks theo yêu cầu user
-      useExtraInfo: true,
+      maxDistance: 128, // Tăng lên 128 blocks (8 chunks)
       count: 1
     })
 
     if (chestBlock) {
-      console.log(`📦 Tìm thấy ${chestBlock.name} tại (${chestBlock.position.x}, ${chestBlock.position.y}, ${chestBlock.position.z})`)
+      const distance = bot.entity.position.distanceTo(chestBlock.position)
+      console.log(`📦 Tìm thấy ${chestBlock.name} tại (${chestBlock.position.x}, ${chestBlock.position.y}, ${chestBlock.position.z}) - ${distance.toFixed(1)} blocks`)
 
-      // Chat tọa độ rương
-      bot.chat(`📦 Tìm thấy rương tại (${chestBlock.position.x}, ${chestBlock.position.y}, ${chestBlock.position.z})!`)
+      // Đào đến rương
+      await digToChest(chestBlock)
 
-      // Di chuyển đến rương sử dụng logic như auto mine
-      await approachChestTarget(chestBlock)
+      // Mở và loot rương
+      await lootChest(chestBlock)
+
+      // Lặp lại ngay (tìm rương mới)
+      return
 
     } else {
-      console.log('🔍 Không tìm thấy rương trong phạm vi 200 blocks, khám phá thêm...')
-      // Di chuyển ngẫu nhiên để tìm kiếm
-      if (Math.random() < 0.3) {
-        const distance = 30 + Math.random() * 20
-        const angle = Math.random() * Math.PI * 2
-        const currentPos = bot.entity.position
-
-        const targetX = currentPos.x + Math.cos(angle) * distance
-        const targetZ = currentPos.z + Math.sin(angle) * distance
-
-        const movements = new Movements(bot)
-        movements.canDig = true
-        bot.pathfinder.setMovements(movements)
-
-        const goal = new goals.GoalXZ(targetX, targetZ)
-        bot.pathfinder.setGoal(goal)
-
-        await new Promise(resolve => setTimeout(resolve, 2000))
-      }
+      console.log('📍 Không có rương trong 128 blocks, đào thẳng để explore...')
+      
+      // Đào thẳng 1 hướng để tìm
+      await digStraightToExplore()
     }
   }
 
-  // Di chuyển đến rương sử dụng logic như auto mine
-  async function approachChestTarget(chestBlock: any) {
+  // Đào đến rương
+  async function digToChest(chestBlock: any) {
     if (!autoChestHuntingActive) return
 
     try {
-      isCurrentlyApproachingChest = true
-      currentChestTarget = chestBlock
-
       const distance = bot.entity.position.distanceTo(chestBlock.position)
+      console.log(`⛏️ Đào đến rương (${distance.toFixed(1)} blocks)`)
 
-      // Di chuyển gần target - sử dụng logic như auto mine
-      if (distance > 3) {
-        console.log(`🚶 Di chuyển đến rương (${Math.round(distance)} blocks away)`)
+      // Trang bị pickaxe tốt nhất
+      const pickaxe = bot.inventory.items()
+        .filter(item => item.name.includes('pickaxe'))
+        .sort((a, b) => {
+          const order = ['netherite', 'diamond', 'iron', 'stone', 'wooden', 'golden']
+          return order.indexOf(a.name.split('_')[0]) - order.indexOf(b.name.split('_')[0])
+        })[0]
 
-        // Dừng pathfinding trước với error handling
-        try {
+      if (pickaxe) {
+        await bot.equip(pickaxe, 'hand')
+      }
+
+      // Pathfinder với canDig = true
+      const movements = new Movements(bot)
+      movements.canDig = true // CHO PHÉP ĐÀO
+      movements.digCost = 1
+      movements.allow1by1towers = true
+      movements.allowParkour = false
+      movements.allowSprinting = true
+      movements.blocksCantBreak.clear()
+      movements.blocksCantBreak.add(bot.registry.blocksByName.bedrock?.id || 0)
+      movements.blocksCantBreak.add(bot.registry.blocksByName.barrier?.id || 0)
+      bot.pathfinder.setMovements(movements)
+
+      const goal = new goals.GoalNear(chestBlock.position.x, chestBlock.position.y, chestBlock.position.z, 2)
+      bot.pathfinder.setGoal(goal)
+
+      // Chờ đến gần rương - tăng thời gian chờ dựa vào khoảng cách
+      const maxWait = Math.max(120, Math.ceil(distance / 2)) // Ít nhất 120 giây, hoặc distance/2
+      let waited = 0
+      let lastLogTime = 0
+      
+      while (autoChestHuntingActive && waited < maxWait) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const dist = bot.entity.position.distanceTo(chestBlock.position)
+        
+        // Log khoảng cách mỗi 5 giây
+        if (waited - lastLogTime >= 5) {
+          console.log(`📏 Khoảng cách đến rương: ${dist.toFixed(1)} blocks`)
+          lastLogTime = waited
+        }
+        
+        if (dist <= 3) {
+          console.log('✅ Đã đến rương!')
           bot.pathfinder.setGoal(null)
-        } catch (err) {
-          // Ignore pathfinder stop errors
+          break
         }
-        await new Promise(resolve => setTimeout(resolve, 200))
+        
+        waited++
+      }
 
-        // Thiết lập pathfinder với error handling
-        try {
-          const movements = new Movements(bot)
-          movements.canDig = true
-          movements.digCost = 1
-          movements.allow1by1towers = true
-          movements.allowParkour = true
-          movements.allowSprinting = true
-          movements.blocksCantBreak.clear()
-          movements.blocksCantBreak.add(bot.registry.blocksByName.bedrock?.id || 0)
-          movements.blocksCantBreak.add(bot.registry.blocksByName.barrier?.id || 0)
-          bot.pathfinder.setMovements(movements)
-
-          // Di chuyển đến gần rương (3 blocks)
-          const goal = new goals.GoalNear(chestBlock.position.x, chestBlock.position.y, chestBlock.position.z, 3)
-          bot.pathfinder.setGoal(goal)
-        } catch (pathErr) {
-          console.log('⚠️ Lỗi thiết lập pathfinder, bỏ qua và tiếp tục')
-        }
-
-        // Kiểm tra liên tục mỗi 2 giây nếu bot cách rương 3 blocks
-        let checkCount = 0
-        const maxChecks = 30 // Tối đa 60 giây (30 * 2s)
-
-        while (autoChestHuntingActive && checkCount < maxChecks) {
-          await new Promise(resolve => setTimeout(resolve, 2000)) // Kiểm tra mỗi 2 giây
-
-          try {
-            const currentDistance = bot.entity.position.distanceTo(chestBlock.position)
-            console.log(`📏 Khoảng cách đến rương: ${currentDistance.toFixed(1)} blocks`)
-
-            if (currentDistance <= 3) {
-              console.log('✅ Đã đến gần rương (≤3 blocks), dừng tất cả hành động')
-              bot.chat('📦 Đã đến rương rồi!')
-
-              // Dừng tất cả hành động khi cách rương 3 blocks
-              stopAll()
-              return
-            }
-          } catch (distErr) {
-            console.log('⚠️ Không thể tính khoảng cách, bỏ qua')
-          }
-
-          checkCount++
-        }
-
-        // Timeout nếu không đến được
-        if (checkCount >= maxChecks) {
-          console.log('⏰ Timeout khi di chuyển đến rương')
-          bot.chat('🥺 Không thể đến rương!')
-          stopAll()
-          return
-        }
-
-      } else {
-        // Đã ở gần rương rồi, dừng ngay
-        console.log('✅ Đã ở gần rương (≤3 blocks)')
-        bot.chat('📦 Đã đến rương rồi!')
-        stopAll()
+      if (waited >= maxWait) {
+        console.log('⏱️ Timeout đào đến rương, bỏ qua')
+        bot.pathfinder.setGoal(null)
       }
 
     } catch (error) {
-      const errorMsg = error?.message || error?.toString() || 'Unknown error'
-      console.log('❌ Lỗi approach chest:', errorMsg)
-      stopAll()
-    } finally {
-      isCurrentlyApproachingChest = false
-      currentChestTarget = null
+      console.log('❌ Lỗi đào đến rương:', (error as any)?.message || error)
+      bot.pathfinder.setGoal(null)
+    }
+  }
 
-      // Đảm bảo dừng pathfinder
-      try {
-        bot.pathfinder.setGoal(null)
-      } catch (err) {
-        // Ignore cleanup errors
+  // Mở và loot rương
+  async function lootChest(chestBlock: any) {
+    if (!autoChestHuntingActive) return
+
+    try {
+      console.log('📦 Mở rương...')
+      
+      // Mở rương
+      const chest = await bot.openContainer(chestBlock)
+      console.log(`📦 Rương có ${chest.containerItems().length} items`)
+
+      // Lấy hết đồ
+      for (const item of chest.containerItems()) {
+        try {
+          await chest.withdraw(item.type, null, item.count)
+          console.log(`✅ Lấy ${item.name} x${item.count}`)
+          await new Promise(resolve => setTimeout(resolve, 200))
+        } catch (e) {
+          // Bỏ qua lỗi
+        }
       }
+
+      chest.close()
+      bot.chat('📦 Đã loot xong rương!')
+      console.log('✅ Loot xong, tìm rương mới...')
+
+      // Kiểm tra túi đầy
+      if (bot.inventory.emptySlotCount() <= 2) {
+        bot.chat('🎒 Túi gần đầy rồi!')
+      }
+
+    } catch (error) {
+      console.log('❌ Lỗi loot rương:', (error as any)?.message || error)
+    }
+  }
+
+  // Đào thẳng 1 hướng để explore
+  let exploreDirection: { x: number, z: number } | null = null
+
+  async function digStraightToExplore() {
+    if (!autoChestHuntingActive) return
+
+    try {
+      // Chọn hướng ngẫu nhiên nếu chưa có
+      if (!exploreDirection) {
+        const angle = Math.random() * Math.PI * 2
+        exploreDirection = {
+          x: Math.cos(angle),
+          z: Math.sin(angle)
+        }
+        console.log(`🧭 Chọn hướng explore: ${angle.toFixed(2)} rad`)
+      }
+
+      // Tính điểm đích (30 blocks theo hướng đã chọn)
+      const currentPos = bot.entity.position
+      const targetX = currentPos.x + exploreDirection.x * 30
+      const targetZ = currentPos.z + exploreDirection.z * 30
+
+      console.log(`⛏️ Đào thẳng đến (${Math.round(targetX)}, ${Math.round(targetZ)})`)
+
+      // Trang bị pickaxe
+      const pickaxe = bot.inventory.items()
+        .filter(item => item.name.includes('pickaxe'))
+        .sort((a, b) => {
+          const order = ['netherite', 'diamond', 'iron', 'stone', 'wooden', 'golden']
+          return order.indexOf(a.name.split('_')[0]) - order.indexOf(b.name.split('_')[0])
+        })[0]
+
+      if (pickaxe) {
+        await bot.equip(pickaxe, 'hand')
+      }
+
+      // Pathfinder với canDig = true
+      const movements = new Movements(bot)
+      movements.canDig = true
+      movements.digCost = 1
+      movements.allow1by1towers = true
+      movements.allowParkour = false
+      movements.allowSprinting = true
+      movements.blocksCantBreak.clear()
+      movements.blocksCantBreak.add(bot.registry.blocksByName.bedrock?.id || 0)
+      movements.blocksCantBreak.add(bot.registry.blocksByName.barrier?.id || 0)
+      bot.pathfinder.setMovements(movements)
+
+      const goal = new goals.GoalXZ(targetX, targetZ)
+      bot.pathfinder.setGoal(goal)
+
+      // Đào trong 10 giây rồi tìm rương lại
+      await new Promise(resolve => setTimeout(resolve, 10000))
+      bot.pathfinder.setGoal(null)
+
+    } catch (error) {
+      console.log('❌ Lỗi explore:', (error as any)?.message || error)
     }
   }
 
@@ -3106,6 +3535,11 @@ async function createBot() {
   // Helper: Trang bị sword tốt nhất
   async function equipBestSword(): Promise<boolean> {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return false
+      }
+      
       const swords = bot.inventory.items().filter(item =>
         item.name.includes('sword')
       )
@@ -3132,7 +3566,7 @@ async function createBot() {
       }
       return false
     } catch (error) {
-      console.log('❌ Lỗi trang bị sword:', error?.message || error)
+      console.log('❌ Lỗi trang bị sword:', (error as any)?.message || error)
       return false
     }
   }
@@ -3140,6 +3574,11 @@ async function createBot() {
   // Helper: Check và ăn golden apple nếu có
   async function eatGoldenAppleIfAvailable(): Promise<boolean> {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return false
+      }
+      
       const goldenApple = bot.inventory.items().find(item =>
         item.name.includes('golden_apple')
       )
@@ -3154,7 +3593,7 @@ async function createBot() {
       }
       return false
     } catch (error) {
-      console.log('⚠️ Lỗi ăn táo vàng:', error?.message || error)
+      console.log('⚠️ Lỗi ăn táo vàng:', (error as any)?.message || error)
       return false
     }
   }
@@ -3162,6 +3601,11 @@ async function createBot() {
   // Helper: Ăn thức ăn để hồi máu - với cooldown log
   async function eatFoodToHeal(): Promise<boolean> {
     try {
+      // Kiểm tra inventory có sẵn sàng chưa
+      if (!bot.inventory) {
+        return false
+      }
+      
       const safeFood = bot.inventory.items().find(item => {
         const name = item.name.toLowerCase()
         const safeItems = [
@@ -3189,7 +3633,7 @@ async function createBot() {
       return false
     } catch (error) {
       // Chỉ log lỗi quan trọng, bỏ qua "Food is full"
-      const errorMsg = error?.message || error?.toString() || ''
+      const errorMsg = (error as any)?.message || (error as any)?.toString() || ''
       if (!errorMsg.includes('Food is full') && !errorMsg.includes('Consuming cancelled')) {
         console.log('⚠️ Lỗi ăn thức ăn:', errorMsg)
       }
@@ -3204,7 +3648,7 @@ async function createBot() {
     stopProtecting()
     if (autoFishingActive) stopSmartAutoFishing()
     if (autoFarmActive) stopAutoFarm()
-    if (autoMiningActive) stopAutoMining(true)
+    if (autoMiningActive) stopAutoMining()
     if (autoChestHuntingActive) stopAutoChestHunting()
 
     // Validate player name trước khi bắt đầu PVP
@@ -3263,9 +3707,23 @@ async function createBot() {
       }
 
       try {
-        await executePvPCycle()
+        // Timeout protection: nếu PVP cycle chạy quá 3 giây thì skip
+        await Promise.race([
+          executePvPCycle(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('PVP cycle timeout')), 3000)
+          )
+        ])
       } catch (error) {
-        console.log('❌ Lỗi PVP cycle:', error?.message || error)
+        const errMsg = (error as any)?.message || error
+        if (errMsg !== 'PVP cycle timeout') {
+          console.log('❌ Lỗi PVP cycle:', errMsg)
+        }
+        // Reset control states nếu bị lỗi
+        try {
+          bot.setControlState('jump', false)
+          bot.setControlState('forward', false)
+        } catch {}
       }
     }, 500) // Check every 0.5 seconds for fast reaction
   }
@@ -3273,10 +3731,25 @@ async function createBot() {
   // Biến lưu tên player đã tìm thấy để tránh spam logs
   let lastFoundPlayerName = ''
   let lastPlayerSearchLog = 0
+  let lastHighJumpLog = 0
+  let pvpCycleRunning = false
+  let lastShieldLog = 0
 
   async function executePvPCycle() {
     if (!pvpActive) return
+    
+    // Tránh chạy nhiều cycle cùng lúc
+    if (pvpCycleRunning) return
+    pvpCycleRunning = true
 
+    try {
+      await executePvPCycleInternal()
+    } finally {
+      pvpCycleRunning = false
+    }
+  }
+
+  async function executePvPCycleInternal() {
     const now = Date.now()
     const allPlayers = Object.keys(bot.players)
 
@@ -3337,21 +3810,41 @@ async function createBot() {
     }
 
     if (!targetPlayer || !targetPlayer.position) {
-      // Chỉ log lỗi mỗi 10 giây (tăng từ 5 giây) và reset found name
-      if (lastFoundPlayerName !== '' || now - lastPlayerSearchLog > 10000) {
-        console.log(`⚠️ Không tìm thấy player "${pvpTargetName}" trong server`)
+      // Chỉ log lỗi mỗi 10 giây và chỉ khi thực sự không tìm thấy player
+      if (!foundPlayerName && (lastFoundPlayerName !== '' || now - lastPlayerSearchLog > 10000)) {
+        console.log(`⚠️ Không tìm thấy player "${pvpTargetName}" trong render distance (~128 blocks)`)
         lastFoundPlayerName = ''
+        lastPlayerSearchLog = now
+      } else if (foundPlayerName && now - lastPlayerSearchLog > 10000) {
+        // Tìm thấy player nhưng entity chưa load
+        console.log(`⏳ Player "${foundPlayerName}" đang load entity...`)
         lastPlayerSearchLog = now
       }
       return
     }
 
-    // Check if target is dead hoặc đang respawn - IMPROVED
-    const isDead = targetPlayer.metadata?.[8] === 0 || targetPlayer.metadata?.[6] === 0
-    const isRespawning = targetPlayer.position.y < 0 || !targetPlayer.isValid
-    const healthLow = targetPlayer.metadata?.[9] <= 0 // Check health metadata
+    // ===== LUÔN AIM VÀO TARGET =====
+    // Ngắm vào target liên tục để theo dõi chính xác
+    try {
+      const targetPos = targetPlayer.position.clone()
+      targetPos.y += targetPlayer.height * 0.6 // Ngắm vào chest level
+      bot.lookAt(targetPos, true) // force = true để aim chính xác
+    } catch (aimError) {
+      // Ignore aim errors
+    }
 
-    if (isDead || isRespawning || healthLow) {
+    // Check if target is dead - CHỈ CHECK KHI THỰC SỰ CHẾT
+    // Không dựa vào metadata vì không đáng tin cậy
+    
+    // Chỉ coi là chết khi:
+    // 1. Entity không hợp lệ (đã despawn)
+    // 2. Y position < 0 (rơi xuống void)
+    // 3. Health = 0 (thực sự chết)
+    const isReallyDead = !targetPlayer.isValid || 
+                         targetPlayer.position.y < 0 || 
+                         (targetPlayer.health !== undefined && targetPlayer.health <= 0)
+
+    if (isReallyDead) {
       // Stop pathfinder immediately to prevent chasing
       bot.pathfinder.setGoal(null)
       bot.pvp.stop()
@@ -3416,18 +3909,20 @@ async function createBot() {
       if (!hasWarnedWeakPlayer || Date.now() - lastPvpTpAttempt > 10000) {
         lastPvpTpAttempt = Date.now()
 
-        // Thử /tp
+        // Thử /tp với safeTeleport
         try {
-          bot.chat(`/tp ${pvpTargetName}`)
-          await new Promise(resolve => setTimeout(resolve, 500))
+          const tpSuccess = safeTeleport(`/tp ${pvpTargetName}`)
+          if (tpSuccess) {
+            await new Promise(resolve => setTimeout(resolve, 500))
 
-          // Check xem có /tp thành công không
-          const newDistance = bot.entity.position.distanceTo(targetPlayer.position)
-          if (newDistance < distance) {
-            bot.chat('Cậu không thoát được đâu❤')
-            console.log('✅ Đã /tp đến target')
+            // Check xem có /tp thành công không
+            const newDistance = bot.entity.position.distanceTo(targetPlayer.position)
+            if (newDistance < distance) {
+              bot.chat('Cậu không thoát được đâu❤')
+              console.log('✅ Đã /tp đến target')
+            }
           } else {
-            console.log('❌ Không có quyền /tp')
+            console.log('⚠️ Không thể /tp (không có quyền hoặc cooldown)')
           }
         } catch (tpError) {
           console.log('⚠️ Lỗi khi thử /tp')
@@ -3440,20 +3935,36 @@ async function createBot() {
       console.log('😆 Đã chat "Sao cậu yếu thế"')
     }
 
-    // Trang bị sword nếu chưa có
-    if (!bot.heldItem || !bot.heldItem.name.includes('sword')) {
-      await equipBestSword()
+    // Trang bị vũ khí phù hợp với chế độ
+    if (bowModeActive) {
+      // Bow mode: trang bị cung
+      const bow = bot.inventory.items().find(item => 
+        item.name === 'bow' || item.name === 'crossbow'
+      )
+      if (bow && (!bot.heldItem || !bot.heldItem.name.includes('bow'))) {
+        await bot.equip(bow, 'hand')
+      }
+    } else {
+      // Melee mode: trang bị sword
+      if (!bot.heldItem || !bot.heldItem.name.includes('sword')) {
+        await equipBestSword()
+      }
     }
 
-    // Check shield mỗi 2 giây
+    // Check shield mỗi 2 giây - KHÔNG BLOCKING
     if (now - lastShieldCheck > 2000) {
       lastShieldCheck = now
 
       // Kiểm tra xem player có đang chặn khiên không (metadata 8 bit 0 = đang blocking)
-      const isBlocking = targetPlayer.metadata?.[8] === 1 // Active hand = blocking
+      const playerMetadata = targetPlayer.metadata as any
+      const isBlocking = playerMetadata?.[8] === 1 // Active hand = blocking
 
-      if (isBlocking) {
-        console.log('🛡️ Player đang chặn khiên! Vòng ra sau lưng...')
+      if (isBlocking && !isCirclingBehind) {
+        // Chỉ log mỗi 3 giây
+        if (now - lastShieldLog > 3000) {
+          console.log('🛡️ Player đang chặn khiên! Vòng ra sau lưng...')
+          lastShieldLog = now
+        }
         isCirclingBehind = true
 
         // Tính góc để vòng ra sau lưng player
@@ -3466,303 +3977,116 @@ async function createBot() {
         const behindX = targetPlayer.position.x + Math.cos(behindAngle) * 2
         const behindZ = targetPlayer.position.z + Math.sin(behindAngle) * 2
 
-        const movements = new Movements(bot)
-        movements.allowSprinting = true
-        movements.allowParkour = true
-        bot.pathfinder.setMovements(movements)
+        try {
+          const movements = new Movements(bot)
+          movements.allowSprinting = true
+          movements.allowParkour = true
+          movements.canDig = false
+          bot.pathfinder.setMovements(movements)
 
-        const behindGoal = new goals.GoalNear(behindX, targetPlayer.position.y, behindZ, 1)
-        bot.pathfinder.setGoal(behindGoal, true)
+          const behindGoal = new goals.GoalNear(behindX, targetPlayer.position.y, behindZ, 1)
+          bot.pathfinder.setGoal(behindGoal, true)
 
-        // Nhảy khi vòng ra sau
-        bot.setControlState('jump', true)
-        bot.setControlState('sprint', true)
+          // Nhảy khi vòng ra sau - KHÔNG AWAIT
+          bot.setControlState('jump', true)
+          bot.setControlState('sprint', true)
 
-        await new Promise(resolve => setTimeout(resolve, 800))
-        bot.setControlState('jump', false)
-
+          setTimeout(() => {
+            bot.setControlState('jump', false)
+            isCirclingBehind = false
+          }, 600)
+        } catch (circleError) {
+          isCirclingBehind = false
+        }
+      } else if (!isBlocking) {
         isCirclingBehind = false
       }
     }
 
-    // Di chuyển về phía target
-    if (distance > 3) {
-      const movements = new Movements(bot)
-      movements.allowSprinting = true
-      movements.allowParkour = true
-      bot.pathfinder.setMovements(movements)
+    // Di chuyển về phía target và tấn công - HỖ TRỢ BOW/MELEE MODE
+    // Tính khoảng cách 3D (bao gồm cả độ cao)
+    const dx = targetPlayer.position.x - bot.entity.position.x
+    const dy = targetPlayer.position.y - bot.entity.position.y
+    const dz = targetPlayer.position.z - bot.entity.position.z
+    const distance3D = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    const horizontalDistance = Math.sqrt(dx * dx + dz * dz)
+    const heightDiff = Math.abs(dy)
+    
+    // Khoảng cách tấn công tùy theo chế độ
+    const attackRange = bowModeActive ? 20 : 4 // Bow: 20 blocks, Melee: 4 blocks
+    const approachRange = bowModeActive ? 15 : 2 // Bow: giữ khoảng cách 15, Melee: đến gần 2
+    
+    // Nếu player bay cao hơn 4 blocks, bot phải nhảy/leo lên (chỉ với melee)
+    if (!bowModeActive && heightDiff > 4 && dy > 0) {
+      if (now - lastHighJumpLog > 3000) {
+        console.log(`🚀 Player bay cao! Độ cao: ${heightDiff.toFixed(1)} blocks`)
+        lastHighJumpLog = now
+      }
+      
+      try {
+        const movements = new Movements(bot)
+        movements.allowSprinting = true
+        movements.allowParkour = true
+        movements.canDig = false
+        bot.pathfinder.setMovements(movements)
 
-      const goal = new goals.GoalFollow(targetPlayer, 2)
-      bot.pathfinder.setGoal(goal, true)
+        const goal = new goals.GoalNear(
+          targetPlayer.position.x, 
+          targetPlayer.position.y, 
+          targetPlayer.position.z, 
+          3
+        )
+        bot.pathfinder.setGoal(goal, true)
+        
+        bot.setControlState('jump', true)
+        bot.setControlState('sprint', true)
+        
+        setTimeout(() => {
+          bot.setControlState('jump', false)
+        }, 200)
+      } catch (pathError) {
+        bot.setControlState('jump', true)
+        setTimeout(() => bot.setControlState('jump', false), 200)
+      }
+      
+    } else if (horizontalDistance > attackRange) {
+      // Player ở xa - di chuyển lại gần
+      try {
+        const movements = new Movements(bot)
+        movements.allowSprinting = true
+        movements.allowParkour = true
+        movements.canDig = false
+        bot.pathfinder.setMovements(movements)
 
-      // Nhảy khi di chuyển đến mục tiêu để nhanh hơn
-      bot.setControlState('jump', true)
+        const goal = new goals.GoalNear(
+          targetPlayer.position.x, 
+          targetPlayer.position.y, 
+          targetPlayer.position.z, 
+          approachRange
+        )
+        bot.pathfinder.setGoal(goal, true)
+
+        bot.setControlState('sprint', true)
+      } catch (pathError) {
+        bot.lookAt(targetPlayer.position)
+        bot.setControlState('forward', true)
+        bot.setControlState('sprint', true)
+      }
+      
+    } else {
+      // Trong tầm tấn công
+      bot.pathfinder.setGoal(null)
+      bot.setControlState('forward', false)
       bot.setControlState('sprint', true)
 
-      await new Promise(resolve => setTimeout(resolve, 300))
-      bot.setControlState('jump', false)
-    }
-
-    // Tấn công với mineflayer-pvp
-    try {
-      bot.pvp.attack(targetPlayer)
-    } catch (attackError) {
-      console.log('⚠️ Lỗi tấn công:', attackError?.message || attackError)
-    }
-  }
-
-  // Main PVP Pro function - With wind charge and mace - IMPROVED
-  startPvPPro = async function(targetName: string) {
-    // Check có wind charge và mace không - BẮT BUỘC
-    // Debug: Log tất cả items trong inventory
-    console.log('🔍 Checking inventory for wind charge and mace...')
-    const allItems = bot.inventory.items().map(item => item.name)
-    console.log('📦 Current inventory:', allItems.join(', '))
-
-    // Tìm wind charge - hỗ trợ nhiều tên khác nhau (bao gồm custom items)
-    const windChargeItem = bot.inventory.items().find(item => {
-      const itemName = item.name.toLowerCase()
-      const displayName = item.displayName?.toLowerCase() || ''
-      // Kiểm tra nhiều biến thể tên của wind charge
-      return itemName.includes('wind') ||
-             itemName.includes('breeze') ||
-             itemName === 'wind_charge' ||
-             itemName === 'breeze_rod' ||
-             displayName.includes('wind') ||
-             displayName.includes('cầu gió')
-    })
-
-    // Tìm mace - hỗ trợ nhiều tên khác nhau (bao gồm custom items)
-    const maceItem = bot.inventory.items().find(item => {
-      const itemName = item.name.toLowerCase()
-      const displayName = item.displayName?.toLowerCase() || ''
-      // Kiểm tra nhiều biến thể tên của mace
-      return itemName.includes('mace') ||
-             itemName === 'mace' ||
-             displayName.includes('mace') ||
-             displayName.includes('búa')
-    })
-
-    const hasWindCharge = !!windChargeItem
-    const hasMace = !!maceItem
-
-    console.log(`✅ Wind charge found: ${hasWindCharge}${windChargeItem ? ` (${windChargeItem.name})` : ''}`)
-    console.log(`✅ Mace found: ${hasMace}${maceItem ? ` (${maceItem.name})` : ''}`)
-
-    if (!hasWindCharge || !hasMace) {
-      bot.chat('🥺 Không có cầu gió hoặc búa! Không thể PVP Pro!')
-      console.log('❌ Missing wind_charge or mace, stopping all actions')
-
-      // Thông báo chi tiết về item nào thiếu
-      if (!hasWindCharge) {
-        bot.chat('⚠️ Thiếu: Wind Charge (Cầu gió)')
-        console.log('❌ Wind charge not found in inventory')
-        console.log('💡 Lưu ý: Wind Charge chỉ có trong Minecraft 1.21+. Server đang chạy 1.19.4')
-        bot.chat('💡 Wind Charge chỉ có trong MC 1.21+. Cần plugin/custom item!')
-      }
-      if (!hasMace) {
-        bot.chat('⚠️ Thiếu: Mace (Búa)')
-        console.log('❌ Mace not found in inventory')
-        console.log('💡 Lưu ý: Mace chỉ có trong Minecraft 1.21+. Server đang chạy 1.19.4')
-        bot.chat('💡 Mace chỉ có trong MC 1.21+. Cần plugin/custom item!')
-      }
-
-      stopAll() // Dừng tất cả thay vì chuyển sang PVP thường
-      return
-    }
-
-    // Dừng các hoạt động khác trước khi bắt đầu
-    stopFollowing()
-    stopProtecting()
-    if (autoFishingActive) stopSmartAutoFishing()
-    if (autoFarmActive) stopAutoFarm()
-    if (autoMiningActive) stopAutoMining(true)
-    if (autoChestHuntingActive) stopAutoChestHunting()
-    if (pvpActive) stopPvP(true) // Dừng PVP thường nếu đang chạy
-
-    pvpProActive = true
-    pvpActive = false // Đảm bảo PVP thường bị tắt
-    pvpTargetName = targetName
-
-    bot.chat(`⚔️ Bắt đầu PVP PRO với ${targetName}! CHỈ dùng Wind Charge + Mace combo! 🔥`)
-    console.log(`⚔️ PVP PRO Mode - Target: ${targetName}`)
-    console.log(`✅ Wind Charge: có, Mace: có - Chỉ dùng combo`)
-
-    // Clear existing interval
-    if (pvpInterval) clearInterval(pvpInterval)
-
-    pvpInterval = setInterval(async () => {
-      if (!pvpProActive) {
-        clearInterval(pvpInterval!)
-        pvpInterval = null
-        return
-      }
-
-      // Kiểm tra lại có đủ items không mỗi cycle
-      const stillHasWindCharge = bot.inventory.items().some(item => {
-        const itemName = item.name.toLowerCase()
-        return itemName.includes('wind') ||
-               itemName.includes('breeze') ||
-               itemName === 'wind_charge' ||
-               itemName === 'breeze_rod'
-      })
-
-      const stillHasMace = bot.inventory.items().some(item => {
-        const itemName = item.name.toLowerCase()
-        return itemName.includes('mace') || itemName === 'mace'
-      })
-
-      if (!stillHasWindCharge || !stillHasMace) {
-        bot.chat('🥺 Hết cầu gió hoặc búa! Dừng PVP Pro!')
-        console.log('❌ Lost wind_charge or mace, stopping PVP Pro')
-        stopPvP(true)
-        return
-      }
-
-      try {
-        await executePvPProCycle()
-      } catch (error) {
-        console.log('❌ Lỗi PVP Pro cycle:', error?.message || error)
-      }
-    }, 800) // Tăng tốc độ check từ 1s xuống 800ms
-  }
-
-  async function executePvPProCycle() {
-    if (!pvpProActive) return
-
-    // Tìm target player với nhiều phương pháp
-    let targetPlayer = bot.players[pvpTargetName]?.entity
-
-    // Tìm player gần đúng nếu không tìm thấy chính xác
-    if (!targetPlayer) {
-      const allPlayers = Object.keys(bot.players)
-      const foundName = allPlayers.find(name =>
-        name.toLowerCase().includes(pvpTargetName.toLowerCase()) ||
-        pvpTargetName.toLowerCase().includes(name.toLowerCase())
-      )
-
-      if (foundName) {
-        targetPlayer = bot.players[foundName]?.entity
-        pvpTargetName = foundName
-      }
-    }
-
-    if (!targetPlayer || !targetPlayer.position) {
-      console.log(`⚠️ Không tìm thấy ${pvpTargetName}`)
-      return
-    }
-
-    // Check if target is dead - IMPROVED
-    const isDead = targetPlayer.metadata?.[8] === 0 || targetPlayer.metadata?.[6] === 0
-    const isRespawning = targetPlayer.position.y < 0 || !targetPlayer.isValid
-    const healthLow = targetPlayer.metadata?.[9] <= 0
-
-    if (isDead || isRespawning || healthLow) {
-      // Stop pathfinder immediately to prevent chasing
-      bot.pathfinder.setGoal(null)
-      bot.pvp.stop()
-
-      bot.chat(`💪 ${pvpTargetName} đã bị tớ cho bay màu với combo Wind Charge + Mace! Quá đỉnh! 🔥`)
-      console.log(`✅ ${pvpTargetName} đã die, dừng PVP Pro`)
-      stopPvP()
-      return
-    }
-
-    const distance = bot.entity.position.distanceTo(targetPlayer.position)
-
-    // PVP PRO: CHỈ DI CHUYỂN, KHÔNG ĐÁNH THƯỜNG
-    if (distance > 4) {
-      // Di chuyển về phía target - KHÔNG tấn công
-      const movements = new Movements(bot)
-      movements.allowSprinting = true
-      movements.allowParkour = true
-      movements.allowFreeMotion = true
-      bot.pathfinder.setMovements(movements)
-
-      const goal = new goals.GoalFollow(targetPlayer, 2)
-      bot.pathfinder.setGoal(goal, true)
-
-      // KHÔNG tấn công khi đang di chuyển - chỉ log
-      if (distance <= 8) {
-        console.log(`🏃 Đang di chuyển đến ${pvpTargetName} (${distance.toFixed(1)}m) - Chờ combo`)
-      }
-    } else {
-      // Gần target (≤4 blocks), thực hiện CHỈ COMBO Wind Charge + Mace
-      try {
-        // Dừng di chuyển để thực hiện combo chính xác
-        bot.pathfinder.setGoal(null)
-
-        // 1. Kiểm tra có wind charge và mace với nhiều biến thể tên
-        const windCharge = bot.inventory.items().find(item => {
-          const itemName = item.name.toLowerCase()
-          return itemName.includes('wind') ||
-                 itemName.includes('breeze') ||
-                 itemName === 'wind_charge' ||
-                 itemName === 'breeze_rod'
-        })
-
-        const mace = bot.inventory.items().find(item => {
-          const itemName = item.name.toLowerCase()
-          return itemName.includes('mace') || itemName === 'mace'
-        })
-
-        if (!windCharge || !mace) {
-          bot.chat('🥺 Hết cầu gió hoặc búa! Dừng PVP Pro!')
-          console.log('❌ Missing items mid-combo, stopping')
-          stopPvP(true)
-          return
+      if (targetPlayer && targetPlayer.isValid) {
+        if (bowModeActive) {
+          // Bow mode: bắn cung tầm xa
+          await bowAttack(targetPlayer, distance3D)
+        } else {
+          // Melee mode: đánh kiếm
+          meleeAttack(targetPlayer, distance3D)
         }
-
-        console.log('🎯 Bắt đầu COMBO Wind Charge + Mace!')
-
-        // 2. Trang bị wind charge
-        await bot.equip(windCharge, 'hand')
-        console.log('💨 Trang bị wind charge')
-        await new Promise(resolve => setTimeout(resolve, 200))
-
-        // 3. Ném wind charge xuống đất để bay cao
-        const groundPos = bot.entity.position.offset(0, -1, 0)
-        await bot.lookAt(groundPos, true)
-        await new Promise(resolve => setTimeout(resolve, 150))
-
-        bot.activateItem() // Ném wind charge
-        console.log('💨 Ném wind charge - BAY LÊN!')
-
-        // 4. Đợi bay lên cao
-        await new Promise(resolve => setTimeout(resolve, 600))
-
-        // 5. Trang bị mace trong khi bay
-        await bot.equip(mace, 'hand')
-        console.log('🔨 Trang bị MACE trong không trung!')
-        await new Promise(resolve => setTimeout(resolve, 100))
-
-        // 6. Nhìm chính xác vào đầu target
-        const targetHead = targetPlayer.position.offset(0, 1.6, 0)
-        await bot.lookAt(targetHead, true)
-
-        // 7. Đợi rơi xuống một chút
-        await new Promise(resolve => setTimeout(resolve, 200))
-
-        // 8. SPAM MACE ATTACK khi rơi xuống
-        console.log('💥 BẮT ĐẦU MACE SMASH COMBO!')
-        for (let i = 0; i < 5; i++) {
-          try {
-            bot.attack(targetPlayer)
-            console.log(`💥 MACE SMASH ${i + 1}/5!`)
-          } catch (attackErr) {
-            // Ignore individual attack errors
-          }
-          await new Promise(resolve => setTimeout(resolve, 50))
-        }
-
-        bot.chat('💥💥💥 ULTRA MACE COMBO HOÀN THÀNH!')
-        console.log('✅ Combo Wind Charge + Mace đã thực hiện xong')
-
-        // 9. Cooldown trước combo tiếp theo
-        await new Promise(resolve => setTimeout(resolve, 2000))
-
-      } catch (comboError) {
-        console.log('❌ Lỗi combo Wind Charge + Mace:', comboError?.message || comboError)
       }
     }
   }
@@ -3771,7 +4095,6 @@ async function createBot() {
   stopPvP = function(silent: boolean = false) {
     console.log('⏹️ Stopping PVP...')
     pvpActive = false
-    pvpProActive = false
     pvpTargetName = ''
     hasWarnedWeakPlayer = false
 
@@ -3799,18 +4122,87 @@ async function createBot() {
     console.log('⏹️ PVP - Deactivated')
   }
 
+  // ------------------ AI Helper Function (Groq - Llama 3) ------------------
+  let lastAIChatTime = 0 // Cooldown cho AI chat
+  
+  async function callAI(prompt: string, systemPrompt?: string): Promise<string | null> {
+    if (!groqApiKey) {
+      console.log('⚠️ Groq API key không được cấu hình')
+      return null
+    }
+
+    try {
+      console.log(`🔍 Groq AI analyzing: "${prompt}"`)
+      
+      const Groq = (await import('groq-sdk')).default
+      const groq = new Groq({ apiKey: groqApiKey })
+      
+      const messages: any[] = []
+      
+      // Validate và thêm system message
+      if (systemPrompt && typeof systemPrompt === 'string' && systemPrompt.trim() !== '') {
+        messages.push({
+          role: 'system',
+          content: systemPrompt.trim()
+        })
+      }
+      
+      // Validate user message
+      if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
+        console.log('⚠️ Invalid prompt')
+        return null
+      }
+      
+      messages.push({
+        role: 'user',
+        content: prompt.trim()
+      })
+
+      console.log(`📤 Sending ${messages.length} messages to Groq`)
+
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.1-8b-instant', // Llama 3.1 8B - cực nhanh, miễn phí
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 100, // Tăng lên 100 cho câu trả lời đầy đủ hơn
+        top_p: 1,
+        stream: false
+      })
+
+      const response = completion.choices[0]?.message?.content
+      console.log(`✅ Groq response: ${response}`)
+      return response || null
+      
+    } catch (error: any) {
+      console.log('❌ Groq API Error:', error?.message || error)
+      
+      // Fallback responses bình thường
+      const fallbacks = [
+        'Tôi không hiểu câu hỏi của bạn.',
+        'Xin lỗi, tôi cần thêm thông tin.',
+        'Tôi chưa có câu trả lời cho điều này.',
+        'Bạn có thể hỏi rõ hơn được không?'
+      ]
+      return fallbacks[Math.floor(Math.random() * fallbacks.length)]
+    }
+  }
+
   // ------------------ AI Agent Handler ------------------
   async function handleAIAgentCommand(username: string, actionRequest: string) {
-    if (!geminiApiKey) {
-      bot.chat('🥺 Tớ chưa được cấu hình Gemini API để thực hiện AI actions!')
+    if (!groqApiKey) {
+      // Im lặng nếu không có AI
       return
     }
 
     try {
+      // Set flag AI Agent đang chạy
+      aiAgentActive = true
+      aiAgentShouldStop = false
+      
       bot.chat(`🤖 AI đang phân tích: "${actionRequest}"...`)
       console.log(`🤖 AI Agent: Processing request from ${username}: ${actionRequest}`)
 
-      // Gọi Gemini API để phân tích hành động
+      // Gọi AI với fallback
       const systemPrompt = `Bạn là AI agent điều khiển bot Minecraft. Phân tích yêu cầu và trả về JSON với các hành động cụ thể.
 
 Yêu cầu: "${actionRequest}"
@@ -3837,40 +4229,17 @@ Các loại action hợp lệ:
 
 Chỉ trả về JSON, không giải thích thêm.`
 
-      const payload = {
-        contents: [{
-          parts: [{
-            text: systemPrompt
-          }]
-        }],
-        generationConfig: {
-          maxOutputTokens: 300,
-          temperature: 0.7
-        }
-      }
+      const generatedText = await callAI(systemPrompt, '300')
 
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiApiKey}`
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      })
-
-      const result = await response.json()
-
-      if (!response.ok) {
-        console.log('❌ Gemini API Error:', result)
-        bot.chat('😵 Lỗi AI API! Không thể phân tích hành động!')
+      // Check nếu bị dừng
+      if (aiAgentShouldStop) {
+        bot.chat('⏸️ AI Agent đã bị dừng!')
+        aiAgentActive = false
         return
       }
 
-      const generatedText = result?.candidates?.[0]?.content?.parts?.[0]?.text
-
       if (!generatedText) {
-        bot.chat('🤔 AI không thể hiểu yêu cầu này!')
+        aiAgentActive = false
         return
       }
 
@@ -3883,6 +4252,7 @@ Chỉ trả về JSON, không giải thích thêm.`
       } catch (parseError) {
         console.log('❌ JSON parse error:', parseError)
         bot.chat('😵 AI trả về format không hợp lệ!')
+        aiAgentActive = false
         return
       }
 
@@ -3892,6 +4262,12 @@ Chỉ trả về JSON, không giải thích thêm.`
 
       // Thực thi từng action
       for (let i = 0; i < aiPlan.actions.length; i++) {
+        // Check nếu bị dừng
+        if (aiAgentShouldStop) {
+          bot.chat('⏸️ AI Agent đã bị dừng!')
+          break
+        }
+        
         const action = aiPlan.actions[i]
         console.log(`🎯 Executing action ${i + 1}/${aiPlan.actions.length}:`, action)
 
@@ -3905,12 +4281,18 @@ Chỉ trả về JSON, không giải thích thêm.`
         }
       }
 
-      bot.chat('✅ Hoàn thành tất cả AI actions!')
+      if (!aiAgentShouldStop) {
+        bot.chat('✅ Hoàn thành tất cả AI actions!')
+      }
       console.log('✅ AI Agent: All actions completed')
 
     } catch (error) {
       console.log('❌ AI Agent error:', error)
       bot.chat('😵 Có lỗi khi xử lý AI command!')
+    } finally {
+      // Reset flag
+      aiAgentActive = false
+      aiAgentShouldStop = false
     }
   }
 
@@ -3950,6 +4332,8 @@ Chỉ trả về JSON, không giải thích thêm.`
 
   // AI Move action
   async function executeAIMove(action: any) {
+    if (aiAgentShouldStop) return // Check stop flag
+    
     const target = action.target?.toLowerCase()
     const distance = action.distance || 20
 
@@ -3962,7 +4346,7 @@ Chỉ trả về JSON, không giải thích thêm.`
       })
       if (tree) {
         await bot.pathfinder.goto(new goals.GoalNear(tree.position.x, tree.position.y, tree.position.z, 2))
-        bot.chat(`✅ Đã đến cây!`)
+        if (!aiAgentShouldStop) bot.chat(`✅ Đã đến cây!`)
       } else {
         bot.chat(`🥺 Không tìm thấy cây gần đây!`)
       }
@@ -3973,7 +4357,7 @@ Chỉ trả về JSON, không giải thích thêm.`
       })
       if (water) {
         await bot.pathfinder.goto(new goals.GoalNear(water.position.x, water.position.y, water.position.z, 2))
-        bot.chat(`✅ Đã đến nước!`)
+        if (!aiAgentShouldStop) bot.chat(`✅ Đã đến nước!`)
       } else {
         bot.chat(`🥺 Không tìm thấy nước!`)
       }
@@ -3983,18 +4367,22 @@ Chỉ trả về JSON, không giải thích thêm.`
       const randomX = currentPos.x + (Math.random() - 0.5) * distance
       const randomZ = currentPos.z + (Math.random() - 0.5) * distance
       await bot.pathfinder.goto(new goals.GoalXZ(randomX, randomZ))
-      bot.chat(`✅ Đã di chuyển!`)
+      if (!aiAgentShouldStop) bot.chat(`✅ Đã di chuyển!`)
     }
   }
 
   // AI Collect action
   async function executeAICollect(action: any) {
+    if (aiAgentShouldStop) return // Check stop flag
+    
     const itemName = action.item?.toLowerCase()
     const count = action.count || 5
 
     bot.chat(`🌳 Đang thu thập ${count} ${itemName}...`)
 
     for (let i = 0; i < count; i++) {
+      if (aiAgentShouldStop) break // Check stop flag in loop
+      
       const block = bot.findBlock({
         matching: (block: any) => block && block.name.toLowerCase().includes(itemName),
         maxDistance: 32
@@ -4002,6 +4390,7 @@ Chỉ trả về JSON, không giải thích thêm.`
 
       if (block) {
         await bot.pathfinder.goto(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2))
+        if (aiAgentShouldStop) break
         await bot.dig(block)
         await new Promise(resolve => setTimeout(resolve, 500))
       } else {
@@ -4010,7 +4399,7 @@ Chỉ trả về JSON, không giải thích thêm.`
       }
     }
 
-    bot.chat(`✅ Đã thu thập ${itemName}!`)
+    if (!aiAgentShouldStop) bot.chat(`✅ Đã thu thập ${itemName}!`)
   }
 
   // AI Dig action
@@ -4128,6 +4517,40 @@ Chỉ trả về JSON, không giải thích thêm.`
     setImmediate(async () => {
       console.log(`🔍 Processing: "${cleanMessage}" từ ${username}`)
 
+      // ============= LỆNH HELP - HIỂN THỊ DANH SÁCH LỆNH =============
+      if (cleanMessage === 'chunhan' || cleanMessage === 'help' || cleanMessage === 'lệnh') {
+        bot.chat('📋 Lệnh: theo, bảo vệ, dừng, farm, câu, đào <quặng>, rương, trồng, khám phá, pvp <tên>, thu thập, home, AI <yêu cầu>')
+        return
+      }
+
+      // ============= KIỂM TRA QUYỀN ĐIỀU KHIỂN BOT =============
+      // Danh sách các lệnh điều khiển cần kiểm tra quyền
+      const controlCommands = [
+        'theo', 'bảo vệ', 'dừng', 'stop', 'farm', 'câu', 'fishing',
+        'auto mine', 'auto đào', 'dừng đào', 'stop mining',
+        'auto xây', 'dừng xây', 'stop build',
+        'auto tìm rương', 'auto chest', 'dừng tìm rương', 'dừng chest', 'stop chest',
+        'auto explore', 'tự khám phá', 'dừng explore', 'stop explore',
+        'auto thu thập', 'auto collect', 'thu thập', 'dừng thu thập', 'stop collect',
+        'auto farmer', 'crop farm', 'dừng farmer', 'stop farmer',
+        'pvp ', 'ngủ', 'cần', 'cất đồ', 'home', 'về nhà',
+        'spam attack', 'tấn công spam', 'en '
+      ]
+      
+      // Kiểm tra xem có phải lệnh điều khiển không
+      const isControlCommand = controlCommands.some(cmd => cleanMessage.includes(cmd)) ||
+                               message.startsWith('AI ') || message.startsWith('ai ')
+      
+      if (isControlCommand) {
+        // Kiểm tra quyền
+        if (!isPlayerAuthorized(username)) {
+          console.log(`🚫 Player "${username}" không có quyền điều khiển bot`)
+          // Bot không phản hồi gì cả - im lặng hoàn toàn
+          return
+        }
+        console.log(`✅ Player "${username}" có quyền điều khiển bot`)
+      }
+
       // KIỂM TRA AI AGENT COMMAND TRƯỚC TIÊN - ƯU TIÊN CAO
       if (message.startsWith('AI ') || message.startsWith('ai ')) {
         const actionRequest = message.substring(3).trim()
@@ -4237,6 +4660,15 @@ Chỉ trả về JSON, không giải thích thêm.`
       } else if (cleanMessage.includes('dừng explore') || cleanMessage.includes('stop explore')) {
         stopAutoExplore()
       // End Auto Explore commands
+      // Auto Collect commands
+      } else if (cleanMessage.includes('auto thu thập') || cleanMessage.includes('auto collect') || cleanMessage.includes('thu thập')) {
+        startAutoCollect()
+      } else if (cleanMessage.includes('dừng thu thập') || cleanMessage.includes('stop collect')) {
+        stopAutoCollect()
+      // Home command
+      } else if (cleanMessage === 'home' || cleanMessage === 'về nhà') {
+        goHome()
+      // End Auto Collect commands
       // PVP commands
       } else if (cleanMessage.startsWith('pvp ')) {
         // Standard PVP command: pvp <playername>
@@ -4245,15 +4677,6 @@ Chỉ trả về JSON, không giải thích thêm.`
           startPvP(targetName)
         } else {
           bot.chat('🤔 Cậu muốn PVP với ai? VD: "pvp Steve"')
-        }
-      } else if (cleanMessage.startsWith('pvppro ') || cleanMessage.startsWith('/pvppro ')) {
-        // PVP Pro command: pvppro <playername> hoặc /pvppro <playername>
-        const startIndex = cleanMessage.startsWith('/pvppro ') ? 8 : 7
-        const targetName = message.substring(startIndex).trim()
-        if (targetName) {
-          startPvPPro(targetName)
-        } else {
-          bot.chat('🤔 Cậu muốn PVP Pro với ai? VD: "pvppro Steve"')
         }
       } else if (cleanMessage === 'list players' || cleanMessage === 'danh sách players') {
         // Debug command: hiển thị danh sách players
@@ -4333,7 +4756,7 @@ Chỉ trả về JSON, không giải thích thêm.`
   bot.on('playerJoined', (player: any) => {
     if (player.username !== bot.username) {
       console.log(`🎉 Player ${player.username} joined game`)
-      welcomePlayer(player.username)
+      // Không chào từng player nữa - chỉ log thôi
     }
   })
 
@@ -4361,7 +4784,7 @@ Chỉ trả về JSON, không giải thích thêm.`
         await new Promise(resolve => setTimeout(resolve, 1000))
 
         // Nếu không có lỗi chat về permission thì có OP
-        if (bot.chat) { // Check if chat function is still available
+        if (typeof bot.chat === 'function') { // Check if chat function is callable
           console.log('✅ Bot có quyền OP - có thể enchant')
         } else {
            throw new Error("Chat function unavailable");
@@ -4609,137 +5032,89 @@ Chỉ trả về JSON, không giải thích thêm.`
 
   // ------------------ AI Chat Handler cho chat thường ------------------
   async function handleChatWithAI(username: string, message: string) {
-    if (!geminiApiKey) {
-      // Không chat gì khi không có AI - im lặng
+    if (!groqApiKey) {
+      console.log('⚠️ Groq API key không được cấu hình, bỏ qua AI chat')
       return
     }
 
+    // Cooldown 3 phút (180 giây)
+    const now = Date.now()
+    const cooldownTime = 180000 // 3 phút = 180000ms
+    
+    if (now - lastAIChatTime < cooldownTime) {
+      const remainingTime = Math.ceil((cooldownTime - (now - lastAIChatTime)) / 1000)
+      console.log(`⏳ AI cooldown: còn ${remainingTime}s`)
+      return // Im lặng, không trả lời
+    }
+
     try {
-      // Không hiển thị "đang suy nghĩ" trong game - chỉ console log
-      console.log(`🤖 AI đang phân tích chat từ ${username}: "${message}"`)
+      console.log(`🤖 Groq AI đang phân tích chat từ ${username}: "${message}"`)
 
-      const systemPrompt = `Bạn là bot Minecraft tên Loli, rất đáng yêu và kawaii! ${username} nói: "${message}".
+      const systemPrompt = `Bạn là bot Minecraft tên ice.
 
-Hãy trả lời một cách tự nhiên với phong cách:
-- Dùng emoji cute: 💕 🌸 ✨ (◕‿◕) >.<  uwu (´∀｀) ♡ 💖 🎀
-- Xưng tớ, gọi cậu
-- Phong cách loli kawaii, ngọt ngào
-- Dưới 80 ký tự để chat game không bị cắt
-- Thêm từ cute như "nè", "mà", "uwu", "kyaa"
-- Trả lời phù hợp với ngữ cảnh`
+Phong cách trả lời:
+- Xưng tôi, gọi bạn
+- Không dùng emoji
+- Trả lời bình thường, tự nhiên
+- Dưới 100 ký tự để chat game không bị cắt
+- Trả lời ngắn gọn, súc tích`
 
-      const payload = {
-        contents: [{
-          parts: [{
-            text: `${systemPrompt}\n\nChat: ${message}`
-          }]
-        }],
-        generationConfig: {
-          maxOutputTokens: 100,
-          temperature: 0.8
-        }
-      }
-
-      // FIX: Gemini API endpoint changed to v1beta and gemini-2.0-flash
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiApiKey}`
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      })
-
-      const result = await response.json()
-
-      if (!response.ok) {
-        console.log('❌ AI API Error:', result)
-        return // Im lặng khi có lỗi
-      }
-
-      const generatedText = result?.candidates?.[0]?.content?.parts?.[0]?.text
+      const generatedText = await callAI(message, systemPrompt)
 
       if (generatedText && generatedText.trim() !== '') {
-        // Trả lời AI trong game - chỉ khi có nội dung hợp lệ
-        const aiResponse = generatedText.substring(0, 80) // Cắt ngắn cho chat game
+        // Trả lời AI trong game - cắt ngắn cho chat
+        const aiResponse = generatedText.substring(0, 100)
         bot.chat(aiResponse)
-        console.log(`💬 AI đã trả lời: "${aiResponse}"`)
+        console.log(`💬 Groq AI đã trả lời: "${aiResponse}"`)
+        
+        // Cập nhật thời gian chat cuối
+        lastAIChatTime = now
       } else {
-        console.log(`🤖 AI không có phản hồi phù hợp cho: "${message}"`)
+        console.log(`🤖 Groq AI không có phản hồi`)
       }
-    } catch (error) {
-      // Im lặng khi có lỗi AI - không spam chat
-      console.error(`❌ Lỗi AI chat với ${username}:`, error.message || error)
+    } catch (error: any) {
+      console.error(`❌ Lỗi Groq AI chat với ${username}:`, error?.message || error)
     }
   }
 
   // ------------------ Question AI Response ------------------
   async function handleQuestionWithAI(username: string, message: string) {
-    if (!geminiApiKey) {
-      bot.chat('🥺 Tớ chưa được cấu hình Gemini AI, cậu liên hệ admin nhé!')
+    if (!groqApiKey) {
+      return
+    }
+
+    // Cooldown 3 phút
+    const now = Date.now()
+    const cooldownTime = 180000
+    
+    if (now - lastAIChatTime < cooldownTime) {
+      const remainingTime = Math.ceil((cooldownTime - (now - lastAIChatTime)) / 1000)
+      console.log(`⏳ AI cooldown: còn ${remainingTime}s`)
       return
     }
 
     try {
-      // Hiển thị tin nhắn đang suy nghĩ
-      bot.chat('💭 Để tớ suy nghĩ cute cute nè~ (◕‿◕)✨')
-
       const question = message.replace(/tớ hỏi nè/i, '').trim()
-      const systemPrompt = `Bạn là bot Minecraft tên Loli, rất đáng yêu và kawaii! ${username} hỏi: "${question}".
+      const systemPrompt = `Bạn là bot Minecraft tên ice.
 
-Hãy trả lời câu hỏi này với phong cách:
-- Dùng nhiều emoji cute: 💕 🌸 ✨ (◕‿◕) >.<  uwu (´∀｀) ♡ 💖 🎀
-- Xưng tớ, gọi cậu
-- Phong cách loli kawaii, ngọt ngào
-- Dưới 100 ký tự
-- Thêm từ cute như "nè", "mà", "uwu", "kyaa"
-- Hữu ích nhưng rất đáng yêu`
+Trả lời câu hỏi:
+- Ngắn gọn, súc tích (dưới 100 ký tự)
+- Xưng tôi, gọi bạn
+- Không dùng emoji
+- Trả lời bình thường, tự nhiên
+- Nếu không biết, thừa nhận thẳng thắn`
 
-      const payload = {
-        contents: [{
-          parts: [{
-            text: `${systemPrompt}\n\nCâu hỏi: ${question}`
-          }]
-        }],
-        generationConfig: {
-          maxOutputTokens: 120,
-          temperature: 0.9
-        }
-      }
-
-      // FIX: Gemini API endpoint changed to v1beta and gemini-2.0-flash
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiApiKey}`
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      })
-
-      const result = await response.json()
-
-      if (!response.ok) {
-        console.log('❌ AI API Error:', result)
-        throw new Error(`API Error: ${result.error?.message || 'Unknown error'}`)
-      }
-
-      const generatedText = result?.candidates?.[0]?.content?.parts?.[0]?.text
+      const generatedText = await callAI(`${systemPrompt}\n\nCâu hỏi: ${question}`, '120')
 
       if (generatedText && generatedText.trim() !== '') {
-        // Trả lời AI trong game - chỉ khi có nội dung thật từ AI
         const aiResponse = generatedText.substring(0, 100)
         bot.chat(aiResponse)
+        lastAIChatTime = now
       } else {
-        // Trả lời đơn giản khi AI không có câu trả lời
-        bot.chat('🥺 Tớ không biết câu trả lời này, cậu hỏi câu khác nhé! (◕‿◕)💕')
+        console.log('⚠️ No AI available for question')
       }
-    } catch (error) {
-      // Trả lời đơn giản khi có lỗi AI
-      bot.chat('🥺 Tớ bị lỗi rồi, cậu hỏi lại sau nhé!')
-      console.error('Lỗi chat AI:', error)
+    } catch (error: any) {
+      console.log('❌ Lỗi AI question:', (error as any)?.message || error)
     }
   }
 
@@ -4797,6 +5172,7 @@ Hãy trả lời câu hỏi này với phong cách:
     let tpFailCount = 0 // Đếm số lần /tp thất bại
     let lastBoatCheck = 0 // Track lần cuối kiểm tra thuyền
     let isInBoat = false // Track trạng thái đang ngồi thuyền
+    let hasAskedToJoinBoat = false // Track đã xin ngồi cùng chưa
     let lastMovementTime = 0 // Track để giảm spam movement
 
     followInterval = setInterval(async () => {
@@ -4814,48 +5190,142 @@ Hãy trả lời câu hỏi này với phong cách:
         equipBestToolForFollowing()
       }
 
-      // KIỂM TRA THUYỀN MỖI 3 GIÂY thay vì 2 giây
-      if (currentTime - lastBoatCheck > 3000) {
+      // KIỂM TRA THUYỀN MỖI 2 GIÂY
+      if (currentTime - lastBoatCheck > 2000) {
         lastBoatCheck = currentTime
 
-        // Kiểm tra xem player có đang ngồi thuyền không
-        const isPlayerOnBoat = targetPlayer.vehicle && targetPlayer.vehicle.name && targetPlayer.vehicle.name.includes('boat')
+        // Kiểm tra xem player có đang ngồi thuyền không - CHẶT CHẼ HƠN
+        const playerVehicle = targetPlayer.vehicle
+        const isPlayerOnBoat = playerVehicle && 
+                               playerVehicle.name && 
+                               (playerVehicle.name === 'boat' || 
+                                playerVehicle.name === 'oak_boat' ||
+                                playerVehicle.name === 'spruce_boat' ||
+                                playerVehicle.name === 'birch_boat' ||
+                                playerVehicle.name === 'jungle_boat' ||
+                                playerVehicle.name === 'acacia_boat' ||
+                                playerVehicle.name === 'dark_oak_boat' ||
+                                playerVehicle.name === 'mangrove_boat' ||
+                                playerVehicle.name === 'cherry_boat' ||
+                                playerVehicle.name === 'bamboo_raft')
 
-        // Tìm thuyền gần trong bán kính 4 blocks
-        const nearbyBoat = bot.nearestEntity((entity: any) => {
-          if (!entity || !entity.position) return false
+        // Debug log
+        if (playerVehicle) {
+          console.log(`🔍 Player vehicle: ${playerVehicle.name}, isBoat: ${isPlayerOnBoat}`)
+        }
+
+        // Nếu player vừa mới ngồi lên thuyền và bot chưa xin ngồi cùng
+        if (isPlayerOnBoat && !isInBoat && !hasAskedToJoinBoat) {
+          // Chat dễ thương xin ngồi cùng
+          const cuteMessages = [
+            '🥺 Cậu đi thuyền à? Cho tớ ngồi cùng được không?',
+            '🛥️ Ơ cậu lên thuyền rồi! Tớ cũng muốn ngồi cùng~',
+            '💕 Đợi tớ với! Tớ cũng muốn đi thuyền cùng cậu!',
+            '🌊 Cậu đi thuyền mà không rủ tớ sao? Cho tớ lên với~'
+          ]
+          const randomMessage = cuteMessages[Math.floor(Math.random() * cuteMessages.length)]
+          bot.chat(randomMessage)
+          hasAskedToJoinBoat = true
+          
+          console.log(`🛥️ Player ${targetPlayer.username} đã ngồi thuyền, bot đang tìm thuyền để ngồi cùng...`)
+        }
+
+        // Tìm thuyền gần nhất trong bán kính 8 blocks (tăng từ 5 lên 8)
+        const nearbyBoats = Object.values(bot.entities).filter((entity: any) => {
+          if (!entity || !entity.position || !entity.name) return false
+          if (!entity.name.includes('boat')) return false
           const boatDistance = bot.entity.position.distanceTo(entity.position)
-          return boatDistance <= 4 && entity.name && entity.name.includes('boat')
+          return boatDistance <= 8 // Tăng bán kính tìm kiếm
         })
 
-        if (nearbyBoat && !isInBoat && isPlayerOnBoat) {
+        // Nếu player đang ngồi thuyền và bot chưa ngồi
+        if (isPlayerOnBoat && !isInBoat && nearbyBoats.length > 0) {
           try {
-            // Di chuyển đến thuyền và ngồi lên
-            const movements = new Movements(bot)
-            movements.allowSprinting = true
-            bot.pathfinder.setMovements(movements)
-            bot.pathfinder.setGoal(new goals.GoalNear(nearbyBoat.position.x, nearbyBoat.position.y, nearbyBoat.position.z, 1))
+            // Tìm thuyền gần nhất
+            let closestBoat = nearbyBoats[0]
+            let closestDistance = bot.entity.position.distanceTo(closestBoat.position)
+            
+            for (const boat of nearbyBoats) {
+              const dist = bot.entity.position.distanceTo(boat.position)
+              if (dist < closestDistance) {
+                closestBoat = boat
+                closestDistance = dist
+              }
+            }
 
+            console.log(`🎯 Tìm thấy thuyền gần nhất cách ${closestDistance.toFixed(1)} blocks`)
+
+            // Nếu thuyền quá xa, di chuyển đến gần trước (tăng ngưỡng từ 2 lên 3)
+            if (closestDistance > 3) {
+              const movements = new Movements(bot)
+              movements.allowSprinting = true
+              movements.canDig = false
+              bot.pathfinder.setMovements(movements)
+              bot.pathfinder.setGoal(new goals.GoalNear(
+                closestBoat.position.x, 
+                closestBoat.position.y, 
+                closestBoat.position.z, 
+                1
+              ))
+              
+              console.log(`🚶 Di chuyển đến thuyền...`)
+            }
+
+            // Đợi 2 giây rồi thử ngồi lên thuyền (tăng từ 1.5 lên 2)
             setTimeout(async () => {
               try {
-                await bot.mount(nearbyBoat)
-                isInBoat = true
-                bot.chat('🛥️ Lên thuyền theo cậu!')
-              } catch (mountError) {
-                // Silent fail
+                // Kiểm tra lại khoảng cách trước khi mount (tăng từ 3 lên 4)
+                const currentDistance = bot.entity.position.distanceTo(closestBoat.position)
+                if (currentDistance <= 4 && closestBoat.isValid) {
+                  await bot.mount(closestBoat)
+                  isInBoat = true
+                  bot.chat('🛥️ Hehe, tớ lên thuyền rồi! Đi thôi~')
+                  console.log(`✅ Bot đã ngồi lên thuyền thành công`)
+                } else {
+                  console.log(`⚠️ Thuyền quá xa hoặc không hợp lệ (${currentDistance.toFixed(1)} blocks)`)
+                  hasAskedToJoinBoat = false // Reset để thử lại
+                }
+              } catch (mountError: any) {
+                console.log(`❌ Lỗi khi ngồi lên thuyền:`, mountError.message)
+                hasAskedToJoinBoat = false // Reset để thử lại
               }
-            }, 1000)
-          } catch (error) {
-            // Silent fail để giảm spam log
+            }, 2000) // Tăng từ 1500ms lên 2000ms
+          } catch (error: any) {
+            console.log(`❌ Lỗi khi tìm thuyền:`, error.message)
+            hasAskedToJoinBoat = false // Reset để thử lại
           }
-        } else if (isInBoat && (!isPlayerOnBoat || distance > 4)) {
+        } 
+        // Nếu player xuống thuyền thì bot cũng xuống ngay
+        else if (isInBoat && !isPlayerOnBoat) {
           try {
-            bot.dismount()
+            await bot.dismount()
             isInBoat = false
-            bot.chat('🛥️ Xuống thuyền!')
-          } catch (error) {
+            hasAskedToJoinBoat = false // Reset flag
+            bot.chat('🛥️ Cậu xuống thuyền rồi à? Tớ cũng xuống theo!')
+            console.log(`✅ Bot đã xuống thuyền vì player xuống`)
+          } catch (error: any) {
+            console.log(`❌ Lỗi khi xuống thuyền:`, error.message)
             isInBoat = false // Reset trạng thái
+            hasAskedToJoinBoat = false
           }
+        }
+        // Nếu bot cách xa player quá (player di chuyển xa)
+        else if (isInBoat && distance > 8) {
+          try {
+            await bot.dismount()
+            isInBoat = false
+            hasAskedToJoinBoat = false
+            bot.chat('🛥️ Cậu đi xa quá! Tớ xuống thuyền theo cậu!')
+            console.log(`✅ Bot đã xuống thuyền vì player đi xa`)
+          } catch (error: any) {
+            console.log(`❌ Lỗi khi xuống thuyền:`, error.message)
+            isInBoat = false
+            hasAskedToJoinBoat = false
+          }
+        }
+        // Reset flag nếu player không còn ngồi thuyền
+        else if (!isPlayerOnBoat && hasAskedToJoinBoat) {
+          hasAskedToJoinBoat = false
         }
       }
 
@@ -4867,29 +5337,29 @@ Hãy trả lời câu hỏi này với phong cách:
       // Nếu quá xa thì teleport
       if (distance > 14) {
         try {
-          // Kiểm tra nếu đã thất bại quá nhiều lần
-          if (tpFailCount >= 3) {
-            bot.chat('🥺 Tớ không có quyền /tp để theo cậu. Dừng theo dõi!')
-            stopFollowing()
+          // Kiểm tra quyền /tp
+          if (hasTpPermission === false) {
+            console.log('⚠️ Không có quyền /tp, không thể theo player xa')
             return
           }
 
-          bot.chat(`/tp ${bot.username} ${targetPlayer.username}`)
+          // Sử dụng safeTeleport
+          const tpSuccess = safeTeleport(`/tp ${bot.username} ${targetPlayer.username}`)
+          
+          if (!tpSuccess) {
+            console.log('⚠️ Không thể /tp (cooldown hoặc không có quyền)')
+            return
+          }
 
           // Kiểm tra thành công sau 2 giây
           setTimeout(() => {
             if (!targetPlayer || !targetPlayer.isValid) return
 
             const newDistance = bot.entity.position.distanceTo(targetPlayer.position)
-            if (newDistance > 15) { // Nếu vẫn xa thì /tp thất bại
-              tpFailCount++
-
-              if (tpFailCount >= 3) {
-                bot.chat('🥺 Tớ không có quyền /tp. Dừng theo dõi!')
-                stopFollowing()
-              }
+            if (newDistance > 15) {
+              console.log('⚠️ Teleport không thành công')
             } else {
-              tpFailCount = 0 // Reset nếu thành công
+              console.log('✅ Teleport thành công')
             }
           }, 2500)
 
@@ -4914,12 +5384,9 @@ Hãy trả lời câu hỏi này với phong cách:
         lastMovementTime = currentTime
 
         try {
-          // Setup movement mới mỗi lần để đảm bảo setting đúng
-          const movements = new Movements(bot)
-          movements.canDig = distance > 10 // Chỉ đào khi cách xa
+          // Sử dụng createSmartMovements() để tự động cho phép đào nếu không có OP
+          const movements = createSmartMovements()
           movements.allow1by1towers = true
-          movements.allowParkour = true
-          movements.allowSprinting = true
           movements.allowEntityDetection = true
           movements.allowFreeMotion = true
           movements.canOpenDoors = true
@@ -5003,11 +5470,28 @@ Hãy trả lời câu hỏi này với phong cách:
     // Tắt nhặt đồ khi bảo vệ để tập trung chiến đấu
     itemCollectionDisabled = true
 
+    // Tự động trang bị giáp tốt nhất khi bắt đầu bảo vệ
+    equipBestArmor()
+
+    // Tự động trang bị khiên vào offhand nếu có
+    const shield = bot.inventory.items().find(item => item.name.includes('shield'))
+    if (shield) {
+      bot.equip(shield, 'off-hand').then(() => {
+        console.log('🛡️ Đã trang bị khiên vào offhand sẵn sàng!')
+        bot.chat('🛡️ Đã trang bị khiên để chống Creeper!')
+      }).catch(e => {
+        console.log('⚠️ Không thể trang bị khiên:', e)
+      })
+    }
+
     // Reset OP check khi bắt đầu bảo vệ mới
     hasOpPermission = null
     hasTriedOpCommand = false
     lastOpCheckTime = 0
     let lastMovementTime = 0 // Track để giảm spam movement logs
+    let lastBoatCheck = 0 // Track lần cuối kiểm tra thuyền
+    let isInBoat = false // Track trạng thái đang ngồi thuyền
+    let hasAskedToJoinBoat = false // Track đã xin ngồi cùng chưa
 
     protectInterval = setInterval(async () => {
       if (!targetPlayer || !targetPlayer.isValid) {
@@ -5019,6 +5503,148 @@ Hãy trả lời câu hỏi này với phong cách:
       const distanceToPlayer = bot.entity.position.distanceTo(targetPos)
       const health = bot.health
       const protectTime = Date.now()
+
+      // KIỂM TRA THUYỀN MỖI 2 GIÂY - GIỐNG NHƯ FOLLOW
+      if (protectTime - lastBoatCheck > 2000) {
+        lastBoatCheck = protectTime
+
+        // Kiểm tra xem player có đang ngồi thuyền không - CHẶT CHẼ HƠN
+        const playerVehicle = targetPlayer.vehicle
+        const isPlayerOnBoat = playerVehicle && 
+                               playerVehicle.name && 
+                               (playerVehicle.name === 'boat' || 
+                                playerVehicle.name === 'oak_boat' ||
+                                playerVehicle.name === 'spruce_boat' ||
+                                playerVehicle.name === 'birch_boat' ||
+                                playerVehicle.name === 'jungle_boat' ||
+                                playerVehicle.name === 'acacia_boat' ||
+                                playerVehicle.name === 'dark_oak_boat' ||
+                                playerVehicle.name === 'mangrove_boat' ||
+                                playerVehicle.name === 'cherry_boat' ||
+                                playerVehicle.name === 'bamboo_raft')
+
+        // Debug log
+        if (playerVehicle) {
+          console.log(`🔍 Player vehicle: ${playerVehicle.name}, isBoat: ${isPlayerOnBoat}`)
+        }
+
+        // Nếu player vừa mới ngồi lên thuyền và bot chưa xin ngồi cùng
+        if (isPlayerOnBoat && !isInBoat && !hasAskedToJoinBoat) {
+          // Chat dễ thương xin ngồi cùng
+          const cuteMessages = [
+            '🥺 Cậu đi thuyền à? Tớ cũng muốn ngồi cùng để bảo vệ cậu!',
+            '🛥️ Đợi tớ với! Tớ phải ngồi cùng mới bảo vệ được cậu~',
+            '💕 Cậu lên thuyền rồi! Cho tớ ngồi cùng nhé, tớ sẽ bảo vệ cậu!',
+            '🌊 Tớ cũng lên thuyền với cậu! Có tớ ở đây an toàn mà~'
+          ]
+          const randomMessage = cuteMessages[Math.floor(Math.random() * cuteMessages.length)]
+          bot.chat(randomMessage)
+          hasAskedToJoinBoat = true
+          
+          console.log(`🛥️ Player ${targetPlayer.username} đã ngồi thuyền, bot đang tìm thuyền để bảo vệ...`)
+        }
+
+        // Tìm thuyền gần nhất trong bán kính 5 blocks
+        const nearbyBoats = Object.values(bot.entities).filter((entity: any) => {
+          if (!entity || !entity.position || !entity.name) return false
+          if (!entity.name.includes('boat')) return false
+          const boatDistance = bot.entity.position.distanceTo(entity.position)
+          return boatDistance <= 5
+        })
+
+        // Nếu player đang ngồi thuyền và bot chưa ngồi
+        if (isPlayerOnBoat && !isInBoat && nearbyBoats.length > 0) {
+          try {
+            // Tìm thuyền gần nhất
+            let closestBoat = nearbyBoats[0]
+            let closestDistance = bot.entity.position.distanceTo(closestBoat.position)
+            
+            for (const boat of nearbyBoats) {
+              const dist = bot.entity.position.distanceTo(boat.position)
+              if (dist < closestDistance) {
+                closestBoat = boat
+                closestDistance = dist
+              }
+            }
+
+            console.log(`🎯 Tìm thấy thuyền gần nhất cách ${closestDistance.toFixed(1)} blocks`)
+
+            // Nếu thuyền quá xa, di chuyển đến gần trước
+            if (closestDistance > 2) {
+              const movements = new Movements(bot)
+              movements.allowSprinting = true
+              movements.canDig = false
+              bot.pathfinder.setMovements(movements)
+              bot.pathfinder.setGoal(new goals.GoalNear(
+                closestBoat.position.x, 
+                closestBoat.position.y, 
+                closestBoat.position.z, 
+                1
+              ))
+              
+              console.log(`🚶 Di chuyển đến thuyền...`)
+            }
+
+            // Đợi 1.5 giây rồi thử ngồi lên thuyền
+            setTimeout(async () => {
+              try {
+                // Kiểm tra lại khoảng cách trước khi mount
+                const currentDistance = bot.entity.position.distanceTo(closestBoat.position)
+                if (currentDistance <= 3 && closestBoat.isValid) {
+                  await bot.mount(closestBoat)
+                  isInBoat = true
+                  bot.chat('🛥️ Tớ lên thuyền rồi! Yên tâm đi, tớ bảo vệ cậu~')
+                  console.log(`✅ Bot đã ngồi lên thuyền để bảo vệ`)
+                } else {
+                  console.log(`⚠️ Thuyền quá xa hoặc không hợp lệ (${currentDistance.toFixed(1)} blocks)`)
+                  hasAskedToJoinBoat = false // Reset để thử lại
+                }
+              } catch (mountError: any) {
+                console.log(`❌ Lỗi khi ngồi lên thuyền:`, mountError.message)
+                hasAskedToJoinBoat = false // Reset để thử lại
+              }
+            }, 1500)
+          } catch (error: any) {
+            console.log(`❌ Lỗi khi tìm thuyền:`, error.message)
+            hasAskedToJoinBoat = false // Reset để thử lại
+          }
+        } 
+        // Nếu player xuống thuyền thì bot cũng xuống ngay
+        else if (isInBoat && !isPlayerOnBoat) {
+          try {
+            await bot.dismount()
+            isInBoat = false
+            hasAskedToJoinBoat = false // Reset flag
+            bot.chat('🛥️ Cậu xuống thuyền rồi à? Tớ cũng xuống theo!')
+            console.log(`✅ Bot đã xuống thuyền vì player xuống`)
+          } catch (error: any) {
+            console.log(`❌ Lỗi khi xuống thuyền:`, error.message)
+            isInBoat = false // Reset trạng thái
+            hasAskedToJoinBoat = false
+          }
+        }
+        // Nếu bot cách xa player quá (player di chuyển xa)
+        else if (isInBoat && distanceToPlayer > 8) {
+          try {
+            await bot.dismount()
+            isInBoat = false
+            hasAskedToJoinBoat = false
+            bot.chat('🛥️ Cậu đi xa quá! Tớ xuống thuyền theo cậu!')
+            console.log(`✅ Bot đã xuống thuyền vì player đi xa`)
+          } catch (error: any) {
+            console.log(`❌ Lỗi khi xuống thuyền:`, error.message)
+            isInBoat = false
+            hasAskedToJoinBoat = false
+          }
+        }
+        // Reset flag nếu player không còn ngồi thuyền
+        else if (!isPlayerOnBoat && hasAskedToJoinBoat) {
+          hasAskedToJoinBoat = false
+        }
+      }
+
+      // ✅ CHO PHÉP TẤN CÔNG MOB KHI NGỒI THUYỀN
+      // Removed blocking logic - bot có thể tấn công khi ngồi thuyền
 
       // Auto buff khi máu yếu - giảm frequency check
       if (health < 8 && (protectTime - lastOpCheckTime) > 15000) { // Tăng lên 15 giây
@@ -5045,12 +5671,12 @@ Hãy trả lời câu hỏi này với phong cách:
         }
       }
 
-      // Tìm quái gần nhất - giảm phạm vi để focused hơn
+      // Tìm quái gần nhất - CHỈ NHỮNG CON NHÌN THẤY (không xuyên tường)
       let mob = bot.nearestEntity((entity: any) => {
         if (!entity || !entity.position) return false
 
         const distanceToMob = bot.entity.position.distanceTo(entity.position)
-        if (distanceToMob > 15) return false // Giảm từ 20 xuống 15 blocks
+        if (distanceToMob > 20) return false // Tăng lên 20 blocks để phát hiện sớm hơn
 
         const hostileMobs = [
           'zombie', 'skeleton', 'creeper', 'spider', 'witch', 'pillager', 'vindicator', 'evoker',
@@ -5068,39 +5694,140 @@ Hãy trả lời câu hỏi này với phong cách:
                          !mobName.includes('villager') &&
                          !mobName.includes('iron_golem')
 
-        return isHostile || isMobType
+        // KIỂM TRA LINE OF SIGHT - CHỈ TẤN CÔNG QUÁI NHÌN THẤY
+        if (isHostile || isMobType) {
+          // Sử dụng hàm hasLineOfSight để kiểm tra chính xác
+          if (!hasLineOfSight(entity)) {
+            return false // Có tường chắn, bỏ qua mob này
+          }
+          
+          return true
+        }
+
+        return false
       })
+
+      // KIỂM TRA CREEPER GẦN VÀ CHỐNG KHIÊN - ƯU TIÊN CAO NHẤT (cũng cần line of sight)
+      const nearbyCreeper = bot.nearestEntity((entity: any) => {
+        if (!entity || !entity.position) return false
+        const mobName = entity.name ? entity.name.toLowerCase() : ''
+        const displayName = entity.displayName ? entity.displayName.toLowerCase() : ''
+        const isCreeper = (mobName.includes('creeper') || displayName.includes('creeper'))
+        
+        if (isCreeper) {
+          // Kiểm tra line of sight cho Creeper
+          if (!hasLineOfSight(entity)) {
+            return false // Creeper bị tường chắn, bỏ qua
+          }
+          return true
+        }
+        
+        return false
+      })
+
+      if (nearbyCreeper) {
+        const creeperDistance = bot.entity.position.distanceTo(nearbyCreeper.position)
+        
+        // Nếu Creeper gần trong 3 blocks
+        if (creeperDistance <= 3) {
+          // Kiểm tra có khiên không
+          const shield = bot.inventory.items().find(item => 
+            item.name.includes('shield')
+          )
+          
+          if (shield) {
+            // Trang bị khiên vào offhand nếu chưa có
+            const offhandItem = bot.inventory.slots[45]
+            if (!offhandItem || !offhandItem.name.includes('shield')) {
+              try {
+                await bot.equip(shield, 'off-hand')
+                console.log('🛡️ Đã trang bị khiên vào offhand!')
+              } catch (e) {
+                console.log('⚠️ Không thể trang bị khiên:', e)
+              }
+            }
+            
+            // Nhìn thẳng vào Creeper
+            await bot.lookAt(nearbyCreeper.position.offset(0, nearbyCreeper.height * 0.5, 0))
+            
+            // Chống khiên xuống (giữ chuột phải)
+            if (!isBlockingWithShield) {
+              bot.activateItem() // Bắt đầu chống khiên
+              isBlockingWithShield = true
+              lastShieldBlockTime = Date.now()
+              console.log('🛡️ CHỐNG KHIÊN! Creeper cách ' + Math.floor(creeperDistance) + ' blocks!')
+              bot.chat('🛡️ Chống khiên chống Creeper!')
+            }
+            
+            // Giữ chống khiên trong 2 giây
+            if (isBlockingWithShield && (Date.now() - lastShieldBlockTime) > 2000) {
+              bot.deactivateItem() // Thả khiên
+              isBlockingWithShield = false
+              console.log('🛡️ Đã hạ khiên')
+            }
+            
+            // Không tấn công khi đang chống khiên, chỉ lùi lại
+            if (creeperDistance < 4) {
+              bot.setControlState('back', true)
+              setTimeout(() => bot.setControlState('back', false), 500)
+            }
+            
+            return // Dừng logic tấn công thường, ưu tiên chống khiên
+          }
+        } else if (isBlockingWithShield) {
+          // Creeper đã xa, hạ khiên
+          bot.deactivateItem()
+          isBlockingWithShield = false
+          console.log('🛡️ Creeper đã xa, hạ khiên')
+        }
+      } else if (isBlockingWithShield) {
+        // Không còn Creeper, hạ khiên
+        bot.deactivateItem()
+        isBlockingWithShield = false
+        console.log('🛡️ Không còn Creeper, hạ khiên')
+      }
 
       // LOGIC BẢO VỆ CẢI THIỆN với ít spam log hơn
       if (distanceToPlayer > 14) { // Giảm ngưỡng teleport xuống 14 blocks
         try {
-          bot.chat(`/tp ${bot.username} ${targetPlayer.username}`)
-          bot.pvp.stop()
+          // Sử dụng safeTeleport thay vì bot.chat trực tiếp
+          const tpSuccess = safeTeleport(`/tp ${bot.username} ${targetPlayer.username}`)
+          
+          if (tpSuccess) {
+            bot.pvp.stop()
+          } else {
+            // Không thể /tp, dùng pathfinder với khả năng đào
+            const movements = createSmartMovements()
+            bot.pathfinder.setMovements(movements)
+            bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3))
+          }
 
           setTimeout(() => {
             if (!targetPlayer || !targetPlayer.isValid) return
 
             const newDistance = bot.entity.position.distanceTo(targetPlayer.position)
             if (newDistance > 15) {
-              // Setup safe movement
-              const movements = new Movements(bot)
-              movements.canDig = true
-              movements.allowSprinting = true
+              // Setup safe movement với khả năng đào
+              const movements = createSmartMovements()
               bot.pathfinder.setMovements(movements)
               bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3))
             }
           }, 2500)
         } catch (e) {
-          // Fallback movement
-          const movements = new Movements(bot)
-          movements.canDig = true
+          // Fallback movement với khả năng đào
+          const movements = createSmartMovements()
+          movements.canDig = false // Không đào xuyên tường
           movements.allowSprinting = true
           bot.pathfinder.setMovements(movements)
           bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3))
         }
       } else if (mob && health > 6 && !isEating) {
-        // CÓ QUÁI VÀ ĐỦ MÁU: TẤN CÔNG
+        // CÓ QUÁI VÀ ĐỦ MÁU: TẤN CÔNG (chỉ quái nhìn thấy)
         const mobDistance = bot.entity.position.distanceTo(mob.position)
+        const mobName = mob.name || mob.displayName || 'Unknown'
+        
+        // Log xác nhận đã nhìn thấy mob - CHỈ LOG 1 LẦN KHI MỚI PHÁT HIỆN
+        // Removed spam log - chỉ log khi cần debug
 
         // Trang bị vũ khí chỉ khi cần thiết
         const currentWeapon = bot.heldItem
@@ -5109,27 +5836,45 @@ Hãy trả lời câu hỏi này với phong cách:
           await new Promise(resolve => setTimeout(resolve, 200))
         }
 
-        if (distanceToPlayer > 8) {
+        // ✅ LOGIC ĐẶC BIỆT KHI NGỒI THUYỀN
+        if (isInBoat) {
+          // Khi ngồi thuyền, chỉ tấn công mob trong tầm, không di chuyển
+          if (mobDistance <= 4) {
+            // Mob đủ gần, tấn công trực tiếp
+            bot.pathfinder.setGoal(null)
+            bot.setControlState('sprint', false) // Không sprint khi ngồi thuyền
+            
+            if (mob && mob.isValid) {
+              // Tấn công nhiều lần
+              for (let attack = 0; attack < 10; attack++) {
+                meleeAttack(mob, mobDistance)
+              }
+            }
+          } else {
+            // Mob xa, không làm gì (không thể di chuyển khi ngồi thuyền)
+            bot.pathfinder.setGoal(null)
+          }
+        }
+        // LOGIC BÌNH THƯỜNG KHI KHÔNG NGỒI THUYỀN
+        else if (distanceToPlayer > 8) {
           // Quá xa player, quay về
           bot.pvp.stop()
-          const movements = new Movements(bot)
-          movements.allowSprinting = true
+          const movements = createSmartMovements()
           bot.pathfinder.setMovements(movements)
           bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3))
         } else if (mobDistance > 4) {
-          // Tiến đến mob nếu an toàn
+          // Tiến đến mob nhanh hơn
           const mobPos = mob.position
           const futureDistanceToPlayer = targetPlayer.position.distanceTo(mobPos)
 
-          if (futureDistanceToPlayer <= 6) {
-            const movements = new Movements(bot)
-            movements.allowSprinting = true
+          if (futureDistanceToPlayer <= 8) { // Tăng từ 6 lên 8 để tấn công chủ động hơn
+            const movements = createSmartMovements()
             bot.pathfinder.setMovements(movements)
-            bot.pathfinder.setGoal(new goals.GoalNear(mobPos.x, mobPos.y, mobPos.z, 2))
+            bot.pathfinder.setGoal(new goals.GoalNear(mobPos.x, mobPos.y, mobPos.z, 1)) // Giảm từ 2 xuống 1 để đến gần hơn
+            bot.setControlState('sprint', true) // Bật sprint ngay
           } else {
             // Mob quá xa, ưu tiên player
-            const movements = new Movements(bot)
-            movements.allowSprinting = true
+            const movements = createSmartMovements()
             bot.pathfinder.setMovements(movements)
             bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3))
           }
@@ -5139,8 +5884,8 @@ Hãy trả lời câu hỏi này với phong cách:
           bot.setControlState('sprint', true)
 
           if (mob && mob.isValid) {
-            // Giảm spam attack từ 8 xuống 5
-            for (let attack = 0; attack < 5; attack++) {
+            // Tăng số đòn tấn công lên 10 để giết nhanh hơn
+            for (let attack = 0; attack < 10; attack++) {
               meleeAttack(mob, mobDistance)
             }
           }
@@ -5162,7 +5907,7 @@ Hãy trả lời câu hỏi này với phong cách:
         bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2))
       }
 
-    }, 800) // Tăng interval từ 600ms lên 800ms để giảm lag
+    }, 200) // Giảm xuống 200ms (0.2 giây) để phản xạ cực nhanh
   }
 
   stopProtecting = function() {
@@ -5170,6 +5915,13 @@ Hãy trả lời câu hỏi này với phong cách:
     if (protectInterval) {
       clearInterval(protectInterval)
       protectInterval = null
+    }
+
+    // Hạ khiên nếu đang chống
+    if (isBlockingWithShield) {
+      bot.deactivateItem()
+      isBlockingWithShield = false
+      console.log('🛡️ Dừng bảo vệ - hạ khiên')
     }
 
     // Bật lại nhặt đồ khi dừng bảo vệ
@@ -5181,6 +5933,13 @@ Hãy trả lời câu hỏi này với phong cách:
 
   function stopAll() {
     // Dừng tất cả hoạt động SILENT - không chat
+    
+    // Dừng AI Agent
+    if (aiAgentActive) {
+      aiAgentShouldStop = true
+      console.log('🛑 Stopping AI Agent...')
+    }
+    
     if (followInterval) {
       clearInterval(followInterval)
       followInterval = null
@@ -5246,7 +6005,7 @@ Hãy trả lời câu hỏi này với phong cách:
     }
 
     // Dừng PVP (gọi stopPvP silent để tránh spam chat)
-    if (pvpActive || pvpProActive) {
+    if (pvpActive) {
       stopPvP(true) // true = silent mode, không chat
     }
 
@@ -5258,6 +6017,15 @@ Hãy trả lời câu hỏi này với phong cách:
       if (exploreInterval) {
         clearInterval(exploreInterval)
         exploreInterval = null
+      }
+    }
+
+    // Dừng auto collect silent
+    if (autoCollectActive) {
+      autoCollectActive = false
+      if (collectInterval) {
+        clearInterval(collectInterval)
+        collectInterval = null
       }
     }
 
@@ -5294,29 +6062,67 @@ Hãy trả lời câu hỏi này với phong cách:
       return
     }
 
+    // Tìm giường trong bán kính 32 blocks (tăng từ 16)
     const bedBlock = bot.findBlock({
       matching: (block: any) => {
         return block.name.includes('bed')
       },
-      maxDistance: 16
+      maxDistance: 32 // Tăng từ 16 lên 32
     })
 
     if (bedBlock) {
+      const distance = bot.entity.position.distanceTo(bedBlock.position)
+      console.log(`🛏️ Tìm thấy giường cách ${distance.toFixed(1)} blocks`)
+      
       bot.chat(`😴 Tớ buồn ngủ quá, đi ngủ thôi nào!`)
+      
       try {
+        // Nếu giường xa hơn 3 blocks, di chuyển đến gần trước
+        if (distance > 3) {
+          console.log(`🚶 Di chuyển đến giường...`)
+          const movements = new Movements(bot)
+          movements.allowSprinting = true
+          movements.canDig = false
+          bot.pathfinder.setMovements(movements)
+          
+          // Di chuyển đến gần giường
+          bot.pathfinder.setGoal(new goals.GoalNear(
+            bedBlock.position.x,
+            bedBlock.position.y,
+            bedBlock.position.z,
+            2
+          ))
+          
+          // Đợi di chuyển đến gần (tối đa 10 giây)
+          let waitTime = 0
+          while (waitTime < 10000) {
+            await new Promise(resolve => setTimeout(resolve, 500))
+            waitTime += 500
+            
+            const currentDistance = bot.entity.position.distanceTo(bedBlock.position)
+            if (currentDistance <= 3) {
+              console.log(`✅ Đã đến gần giường`)
+              break
+            }
+          }
+        }
+        
+        // Thử ngủ
         await bot.sleep(bedBlock)
         bot.chat(`Zzz... 😴`)
-      } catch (err) {
+        console.log(`✅ Bot đã ngủ thành công`)
+      } catch (err: any) {
         bot.chat(`😢 Tớ không ngủ được ở đây. Cậu tìm chỗ khác nhé.`)
-        console.log('Lỗi ngủ:', err)
+        console.log('❌ Lỗi ngủ:', err.message || err)
       }
     } else {
-      bot.chat(`🛌 Tớ không tìm thấy giường nào gần đây cả.`)
+      bot.chat(`🛌 Tớ không tìm thấy giường nào trong bán kính 32 blocks.`)
+      console.log('❌ Không tìm thấy giường')
     }
   }
 
   // ------------------ Give Item ------------------
-  function giveItemToPlayer(username: string, msg: string) {
+  async function giveItemToPlayer(username: string, msg: string) {
     const match = msg.match(/cần (\d+) (\w+)/)
     if (!match) return
 
@@ -5361,21 +6167,51 @@ Hãy trả lời câu hỏi này với phong cách:
       return
     }
 
-    const throwItem = async () => {
-      try {
-        const distance = bot.entity.position.distanceTo(playerEntity.position)
-        if (distance > 3) {
-          bot.pathfinder.setGoal(new goals.GoalFollow(playerEntity, 2))
-        } else {
-          await bot.toss(item.type, null, qty)
-          bot.chat(`🎁 Đã ném ${item.name} cho ${username}`)
+    try {
+      const distance = bot.entity.position.distanceTo(playerEntity.position)
+      
+      // BƯỚC 1: Di chuyển đến gần player 2 blocks nếu xa
+      if (distance > 2.5) {
+        bot.chat(`🏃 Đợi tớ một chút, đang đến gần để đưa ${name} nè~`)
+        
+        const movements = new Movements(bot)
+        movements.canDig = false
+        movements.allow1by1towers = false
+        bot.pathfinder.setMovements(movements)
+        bot.pathfinder.setGoal(new goals.GoalNear(playerEntity.position.x, playerEntity.position.y, playerEntity.position.z, 2))
+        
+        // Đợi bot đến gần (timeout 10 giây)
+        const startTime = Date.now()
+        while (bot.entity.position.distanceTo(playerEntity.position) > 2.5) {
+          if (Date.now() - startTime > 10000) {
+            bot.chat(`🥺 Không thể đến gần được, cậu lại gần tớ nhé!`)
+            bot.pathfinder.setGoal(null)
+            return
+          }
+          await new Promise(resolve => setTimeout(resolve, 100))
         }
-      } catch (error) {
-        console.log('Lỗi ném item:', error)
+        
+        bot.pathfinder.setGoal(null)
       }
+      
+      // BƯỚC 2: Chat để player đứng yên
+      bot.chat(`📍 Đứng yên giúp tớ nhé, tớ sắp ném ${name} rồi! 🎁`)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      
+      // BƯỚC 3: Nhìn vào chân player (feet position)
+      const feetPosition = playerEntity.position.clone()
+      await bot.lookAt(feetPosition)
+      await new Promise(resolve => setTimeout(resolve, 300))
+      
+      // BƯỚC 4: Ném vật phẩm
+      await bot.toss(item.type, null, qty)
+      bot.chat(`🎁 Đã ném ${qty} ${item.name} cho cậu rồi nè! ✨`)
+      console.log(`✅ Đã ném ${qty} ${item.name} cho ${username}`)
+      
+    } catch (error) {
+      console.log('❌ Lỗi ném item:', error)
+      bot.chat(`🥺 Có lỗi khi ném ${name}, thử lại nhé!`)
     }
-
-    throwItem()
   }
 
   // ------------------ Cất đồ vào rương ------------------
@@ -5585,26 +6421,36 @@ Hãy trả lời câu hỏi này với phong cách:
             await new Promise(resolve => setTimeout(resolve, 500))
           }
 
-          // Tấn công mob gần nhất với kiểm tra autoBowMode
+          // Tấn công mob gần nhất - ÁP DỤNG LOGIC GIỐNG PROTECT
           const mobDistance = bot.entity.position.distanceTo(mob.position)
 
-          // Bow code removed - only melee attack
-          {
-            // Tấn công cận chiến - giảm spam từ 15 xuống 5 lần
-            equipBestWeapon()
+          // TRONG AUTO MINE: Giữ pickaxe để đánh mob (không đổi sang kiếm)
+          // Đảm bảo đang cầm pickaxe
+          if (!bot.heldItem || !bot.heldItem.name.includes('pickaxe')) {
+            await equipBestPickaxe()
+          }
+          
+          if (mobDistance <= 4) {
+            // Mob đủ gần - TẤN CÔNG TRỰC TIẾP với pickaxe
+            bot.pathfinder.setGoal(null)
             bot.setControlState('sprint', true)
 
-            if (mob && mob.isValid && mobDistance <= 7) {
-              // Giảm spam attack từ 15 xuống 5 lần để giảm lag
-              for (let attack = 0; attack < 5; attack++) {
-                meleeAttack(mob, mobDistance)
-              }
-
-              // Chỉ log mỗi 5 giây
-              if (!lastAttackTime || currentTime - lastAttackTime > 5000) {
-                console.log(`⚔️ Attacking ${mob.name} x5`)
+            if (mob && mob.isValid) {
+              // Đánh mob bằng pickaxe (không cần critical hit phức tạp)
+              for (let attack = 0; attack < 10; attack++) {
+                if (mob && mob.isValid) {
+                  bot.attack(mob)
+                  await new Promise(resolve => setTimeout(resolve, 500))
+                }
               }
             }
+          } else if (mobDistance <= 7) {
+            // Mob hơi xa - di chuyển lại gần
+            const movements = new Movements(bot)
+            movements.canDig = false
+            movements.allowSprinting = true
+            bot.pathfinder.setMovements(movements)
+            bot.pathfinder.setGoal(new goals.GoalNear(mob.position.x, mob.position.y, mob.position.z, 2))
           }
 
           // Thu thập item sau khi giết
@@ -5742,7 +6588,7 @@ Hãy trả lời câu hỏi này với phong cách:
           // Trang bị lại pickaxe sau khi ăn
           await equipBestPickaxe()
         } catch (eatError) {
-          console.log('⚠️ Lỗi ăn:', eatError.message)
+          console.log('⚠️ Lỗi ăn:', (eatError as Error).message || eatError)
           isEating = false
         }
         return // Bỏ qua cycle này để ăn
@@ -5762,7 +6608,39 @@ Hãy trả lời câu hỏi này với phong cách:
     const oreBlock = bot.findBlock({
       matching: (block: any) => {
         if (!block) return false
-        return isTargetOreType(block, targetOreType)
+        if (!isTargetOreType(block, targetOreType)) return false
+        
+        // ANTI-XRAY: Chỉ đào quặng đã lộ ra (có ít nhất 1 mặt tiếp xúc với không khí)
+        // Kiểm tra 6 mặt xung quanh block
+        const pos = block.position
+        const surroundingPositions = [
+          pos.offset(1, 0, 0),   // Đông
+          pos.offset(-1, 0, 0),  // Tây
+          pos.offset(0, 1, 0),   // Trên
+          pos.offset(0, -1, 0),  // Dưới
+          pos.offset(0, 0, 1),   // Nam
+          pos.offset(0, 0, -1)   // Bắc
+        ]
+        
+        // Kiểm tra xem có ít nhất 1 mặt là không khí hoặc nước (block đã lộ ra)
+        for (const checkPos of surroundingPositions) {
+          const adjacentBlock = bot.blockAt(checkPos)
+          if (adjacentBlock) {
+            const blockName = adjacentBlock.name.toLowerCase()
+            // Block được coi là "lộ ra" nếu tiếp xúc với không khí, nước, lava, hoặc các block trong suốt
+            if (blockName === 'air' || 
+                blockName === 'cave_air' || 
+                blockName === 'water' || 
+                blockName === 'lava' ||
+                blockName === 'grass' ||
+                blockName === 'tall_grass' ||
+                adjacentBlock.transparent) {
+              return true
+            }
+          }
+        }
+        
+        return false // Block bị bao quanh hoàn toàn = quặng ảo từ anti-xray
       },
       maxDistance: 128, // Đúng như yêu cầu user - phạm vi 128 blocks
       useExtraInfo: true,
@@ -5843,7 +6721,7 @@ Hãy trả lời câu hỏi này với phong cách:
         return false
       }
     } catch (error) {
-      console.log('❌ Lỗi trang bị pickaxe:', error.message || error)
+      console.log('❌ Lỗi trang bị pickaxe:', (error as Error).message || error)
       return false
     }
   }
@@ -5963,10 +6841,14 @@ Hãy trả lời câu hỏi này với phong cách:
           await Promise.race([digPromise, timeoutPromise])
           console.log(`✅ Đã đào xong ${oreBlock.name}!`)
           digSuccess = true
+          
+          // ĐÀO TOÀN BỘ CỤM QUẶNG LIỀN KỀ (VEIN MINING)
+          await digAdjacentOres(oreBlock.position, oreBlock.name)
+          
           break
 
         } catch (digError) {
-          const errorMsg = digError.message || digError.toString()
+          const errorMsg = (digError as Error).message || (digError as Error).toString()
 
           if (errorMsg.includes('Digging aborted') || errorMsg.includes('aborted')) {
             console.log(`⚠️ Đào bị hủy lần ${attempt + 1}, thử lại...`)
@@ -5997,8 +6879,7 @@ Hãy trả lời câu hỏi này với phong cách:
       }
 
       if (!digSuccess) {
-        console.log(`❌ Không thể đào ${oreBlock.name} sau 3 lần thử`)
-        bot.chat('😵 Block này khó đào quá, tớ bỏ qua nhé!')
+        console.log(`❌ Không thể đào ${oreBlock.name} sau 3 lần thử - bỏ qua block này`)
       }
 
       // Lưu vị trí đã đào để tránh lặp lại
@@ -6008,7 +6889,7 @@ Hãy trả lời câu hỏi này với phong cách:
       await collectDroppedItems(oreBlock.position)
 
     } catch (error) {
-      console.log('❌ Lỗi approach and dig:', error.message || error)
+      console.log('❌ Lỗi approach and dig:', (error as Error).message || error)
       try {
         bot.stopDigging()
       } catch (e) {}
@@ -6025,6 +6906,67 @@ Hãy trả lời câu hỏi này với phong cách:
       bot.setControlState('left', false)
       bot.setControlState('right', false)
       bot.setControlState('sprint', false)
+    }
+  }
+
+  // Hàm đào tất cả quặng liền kề (vein mining)
+  async function digAdjacentOres(centerPos: any, oreName: string) {
+    if (!autoMiningActive) return
+    
+    const dugPositions = new Set<string>()
+    const toCheck: any[] = []
+    
+    // Thêm vị trí trung tâm vào danh sách đã đào
+    dugPositions.add(`${centerPos.x},${centerPos.y},${centerPos.z}`)
+    
+    // Kiểm tra 26 vị trí xung quanh (3x3x3 cube)
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (dx === 0 && dy === 0 && dz === 0) continue
+          toCheck.push(centerPos.offset(dx, dy, dz))
+        }
+      }
+    }
+    
+    // Đào từng block liền kề
+    for (const checkPos of toCheck) {
+      if (!autoMiningActive) break
+      
+      const posKey = `${checkPos.x},${checkPos.y},${checkPos.z}`
+      if (dugPositions.has(posKey)) continue
+      
+      const block = bot.blockAt(checkPos)
+      if (!block || block.name !== oreName) continue
+      
+      // Kiểm tra khoảng cách
+      const distance = bot.entity.position.distanceTo(checkPos)
+      if (distance > 5) continue
+      
+      console.log(`⛏️ Đào quặng liền kề tại (${checkPos.x}, ${checkPos.y}, ${checkPos.z})`)
+      
+      try {
+        // Đảm bảo đang cầm pickaxe
+        if (!bot.heldItem || !bot.heldItem.name.includes('pickaxe')) {
+          await equipBestPickaxe()
+        }
+        
+        // Nhìn vào block
+        await bot.lookAt(checkPos.offset(0.5, 0.5, 0.5), true)
+        await new Promise(resolve => setTimeout(resolve, 100))
+        
+        // Đào block
+        await bot.dig(block, true)
+        console.log(`✅ Đã đào quặng liền kề!`)
+        
+        dugPositions.add(posKey)
+        
+        // Đệ quy đào các quặng liền kề của block này
+        await digAdjacentOres(checkPos, oreName)
+        
+      } catch (error) {
+        // Bỏ qua lỗi và tiếp tục với block tiếp theo
+      }
     }
   }
 
@@ -6180,65 +7122,46 @@ Hãy trả lời câu hỏi này với phong cách:
     }
   }
 
-  // Check if crop is mature
+  // Check if crop is mature - ĐƠN GIẢN HÓA
   function isCropMature(block: any): boolean {
     if (!block || !block.name) return false
 
     const blockName = block.name.toLowerCase()
 
-    // Get age from block metadata - use different methods
+    // Get age from block metadata
     let cropAge = -1
-    try {
-      // Method 1: block.properties?.age (newer mineflayer versions)
-      if (block.properties && typeof block.properties === 'object' && block.properties.age !== undefined) {
-        cropAge = Number(block.properties.age)
+    
+    // Method 1: block.metadata (MOST RELIABLE)
+    if (block.metadata !== undefined && block.metadata !== null) {
+      cropAge = Number(block.metadata)
+    }
+    
+    // Method 2: block.properties?.age
+    if (cropAge === -1 && block.properties?.age !== undefined) {
+      cropAge = Number(block.properties.age)
+    }
+    
+    // Method 3: stateId calculation
+    if (cropAge === -1 && block.stateId !== undefined) {
+      if (blockName.includes('wheat')) {
+        cropAge = (block.stateId - 3357) % 8
+      } else if (blockName.includes('carrot')) {
+        cropAge = (block.stateId - 6322) % 8
+      } else if (blockName.includes('potato')) {
+        cropAge = (block.stateId - 6338) % 8
+      } else if (blockName.includes('beetroot')) {
+        cropAge = (block.stateId - 9223) % 4
       }
-
-      // Method 2: block.state?.properties?.age
-      if (cropAge === -1 && block.state && block.state.properties && block.state.properties.age !== undefined) {
-        cropAge = Number(block.state.properties.age)
-      }
-
-      // Method 3: getProperties() helper
-      if (cropAge === -1 && block.getProperties && typeof block.getProperties === 'function') {
-        const props = block.getProperties()
-        if (props && props.age !== undefined) cropAge = Number(props.age)
-      }
-
-      // Method 4: metadata (older versions)
-      if (cropAge === -1 && block.metadata !== undefined) {
-        cropAge = Number(block.metadata)
-      }
-
-      // Method 5: fallback to stateId lower bits (best-effort)
-      if (cropAge === -1 && block.stateId !== undefined) {
-        cropAge = Number(block.stateId % 8)
-      }
-    } catch (error) {
-      console.log('⚠️ Lỗi lấy crop age:', error)
-      cropAge = -1
     }
 
-    // Debugging helper: print only when cropAge is unknown or > threshold
-    if (cropAge === -1) {
-      console.log(`🌾 Checking crop: ${blockName}, age: unknown (-1) - will treat as not mature`)
-    } else {
-      console.log(`🌾 Checking crop: ${blockName}, age: ${cropAge}`)
-    }
-
-    // Normalize checks for both singular/plural block names
-    // Wheat, carrots, potatoes need age 7
+    // Check maturity
     if (blockName.includes('wheat') || blockName.includes('carrot') || blockName.includes('potato')) {
       return cropAge === 7
     }
-
-    // Beetroot needs age 3
     if (blockName.includes('beetroot')) {
       return cropAge === 3
     }
-
-    // Nether wart needs age 3
-    if (blockName.includes('nether_wart') || blockName.includes('netherwart')) {
+    if (blockName.includes('nether_wart')) {
       return cropAge === 3
     }
 
@@ -6265,7 +7188,7 @@ Hãy trả lời câu hỏi này với phong cách:
     )
   }
 
-  // Start auto crop farming
+  // Start auto crop farming - VÒNG LẶP VÔ HẠN
   startAutoCropFarmer = function() {
     // Stop other activities
     stopFollowing()
@@ -6278,159 +7201,321 @@ Hãy trả lời câu hỏi này với phong cách:
     autoCropFarmerActive = true
     harvestedCrops.clear()
 
-    bot.chat('🌾 Bắt đầu auto farmer! Tớ sẽ thu hoạch và trồng cây!')
-    console.log('🌾 Auto Crop Farmer - Activated')
+    bot.chat('🌾 Bắt đầu auto farmer vòng lặp! Thu hoạch → Trồng → Bón phân!')
+    console.log('🌾 Auto Crop Farmer - Activated (Vòng lặp)')
 
-    // Clear previous interval if exists
-    if (cropFarmerInterval) {
-      clearInterval(cropFarmerInterval)
+    // Chạy vòng lặp vô hạn
+    const runCycle = async () => {
+      while (autoCropFarmerActive) {
+        try {
+          await executeCropFarmingCycle()
+          // Chờ 2 giây trước khi lặp lại
+          await new Promise(resolve => setTimeout(resolve, 2000))
+        } catch (error) {
+          console.log('❌ Lỗi auto crop farming:', error)
+          await new Promise(resolve => setTimeout(resolve, 5000))
+        }
+      }
     }
 
-    cropFarmerInterval = setInterval(async () => {
-      if (!autoCropFarmerActive) {
-        clearInterval(cropFarmerInterval!)
-        cropFarmerInterval = null
-        return
-      }
-
-      try {
-        await executeCropFarmingCycle()
-      } catch (error) {
-        console.log('❌ Lỗi auto crop farming:', error)
-        bot.pathfinder.setGoal(null)
-      }
-    }, 2000) // Every 2 seconds
+    runCycle()
   }
 
-  // Execute one crop farming cycle - THEO Ý TƯỞNG MỚI
+  // Execute one crop farming cycle - 3 PHA: THU HOẠCH → TRỒNG → BÓN PHÂN → LẶP LẠI
   async function executeCropFarmingCycle() {
     if (!autoCropFarmerActive) return
 
-    // Pha 1.2: Kiểm Tra và Trang Bị Hoe
+    // Trang bị hoe
     if (!await equipBestHoe()) {
-      bot.chat('Tôi không có hoe để làm nông. Hành động dừng.')
+      bot.chat('Tôi không có hoe để làm nông.')
       stopAutoCropFarmer()
       return
     }
 
-    // Pha 2.3: Quét Vùng và Tìm Cây Chín (32 blocks)
-    const matureCrop = bot.findBlock({
+    // ===== PHA 1: THU HOẠCH HẾT =====
+    console.log('🌾 === PHA 1: THU HOẠCH ===')
+    
+    // Debug: Tìm TẤT CẢ cây trồng trước
+    const allCrops = bot.findBlocks({
       matching: (block: any) => {
-        if (!block || !block.position) return false
-        const blockName = block.name.toLowerCase()
-        const isCrop = blockName.includes('wheat') ||
-                      blockName.includes('carrots') ||
-                      blockName.includes('potatoes') ||
-                      blockName.includes('beetroots')
-        if (!isCrop) return false
-
-        // Kiểm tra cây đã chín chưa
-        return isCropMature(block)
+        if (!block) return false
+        const name = block.name
+        return name === 'wheat' || name === 'carrots' || name === 'potatoes' || name === 'beetroots'
       },
       maxDistance: 32,
-      count: 1
+      count: 20
     })
-
-    if (!matureCrop) {
-      console.log('Không tìm thấy cây chín trong phạm vi 32 block.')
-      return
-    }
-
-    const posKey = `${matureCrop.position.x},${matureCrop.position.y},${matureCrop.position.z}`
     
-    // Tránh thu hoạch lại cây đã thu hoạch
-    if (harvestedCrops.has(posKey)) {
-      harvestedCrops.delete(posKey) // Clear để tránh bị đầy
+    console.log(`🔍 Tìm thấy ${allCrops.length} cây trồng trong phạm vi`)
+    
+    // Debug: Kiểm tra 5 cây đầu tiên
+    for (let i = 0; i < Math.min(5, allCrops.length); i++) {
+      const block = bot.blockAt(allCrops[i])
+      if (block) {
+        const mature = isCropMature(block)
+        console.log(`  ${block.name}: metadata=${block.metadata}, stateId=${block.stateId}, chín=${mature}`)
+      }
+    }
+    
+    let harvestCount = 0
+    let maxAttempts = 100 // Giới hạn để tránh vòng lặp vô hạn
+    
+    for (let i = 0; i < maxAttempts && autoCropFarmerActive; i++) {
+      // Tìm cây chín gần nhất
+      const matureCrops = bot.findBlocks({
+        matching: (block: any) => {
+          if (!block) return false
+          const name = block.name
+          if (name !== 'wheat' && name !== 'carrots' && name !== 'potatoes' && name !== 'beetroots') {
+            return false
+          }
+          return isCropMature(block)
+        },
+        maxDistance: 32,
+        count: 1
+      })
+
+      if (matureCrops.length === 0) {
+        console.log(`✅ Không còn cây chín! Đã thu hoạch ${harvestCount} cây`)
+        break
+      }
+
+      const cropPos = matureCrops[0]
+      const cropBlock = bot.blockAt(cropPos)
+      if (!cropBlock) continue
+
+      try {
+        // Di chuyển đến cây
+        const movements = new Movements(bot)
+        movements.canDig = false
+        bot.pathfinder.setMovements(movements)
+        await bot.pathfinder.goto(new goals.GoalNear(cropPos.x, cropPos.y, cropPos.z, 1))
+
+        // Thu hoạch
+        await bot.dig(cropBlock)
+        harvestCount++
+        console.log(`✅ Thu hoạch ${cropBlock.name} (${harvestCount})`)
+
+        // Chờ và thu thập item
+        await new Promise(resolve => setTimeout(resolve, 500))
+
+        // Kiểm tra túi đầy
+        if (bot.inventory.emptySlotCount() <= 1) {
+          bot.chat('Hành lý đầy!')
+          stopAutoCropFarmer()
+          return
+        }
+
+      } catch (error) {
+        console.log('❌ Lỗi thu hoạch:', (error as any)?.message || error)
+      }
+    }
+
+    // ===== PHA 2: TRỒNG LẠI HẾT =====
+    console.log('🌱 === PHA 2: TRỒNG LẠI ===')
+    
+    // Kiểm tra hạt giống
+    const seeds = bot.inventory.items().filter(item => {
+      return item.name === 'wheat_seeds' || item.name === 'carrot' || 
+             item.name === 'potato' || item.name === 'beetroot_seeds'
+    })
+    
+    console.log(`📦 Hạt giống: ${seeds.map(s => `${s.name} x${s.count}`).join(', ')}`)
+    
+    if (seeds.length === 0) {
+      console.log('⚠️ Không có hạt giống!')
+      bot.chat('Không có hạt giống để trồng!')
+      stopAutoCropFarmer()
       return
     }
-
-    console.log(`🌾 Tìm thấy cây chín: ${matureCrop.name} tại (${matureCrop.position.x}, ${matureCrop.position.y}, ${matureCrop.position.z})`)
-
-    try {
-      // Pha 2.4: Thu Hoạch An Toàn - Di chuyển đến cây
-      const movements = new Movements(bot)
-      movements.canDig = false
-      bot.pathfinder.setMovements(movements)
-
-      await bot.pathfinder.goto(new goals.GoalNear(matureCrop.position.x, matureCrop.position.y, matureCrop.position.z, 1))
-
-      // Lưu lại vị trí farmland để gieo lại sau
-      const farmlandPosition = matureCrop.position.offset(0, -1, 0)
-      const farmlandBlock = bot.blockAt(farmlandPosition)
-
-      // Thu hoạch bằng activateBlock (nhấp chuột phải) thay vì dig
-      await bot.activateBlock(matureCrop)
-      console.log(`✅ Đã thu hoạch ${matureCrop.name}`)
-      harvestedCrops.add(posKey)
-
-      // Thu thập item rơi ra
-      await new Promise(resolve => setTimeout(resolve, 500))
-      const entities = Object.values(bot.entities)
-      for (const entity of entities) {
-        if (entity.name === 'item' && entity.position &&
-            bot.entity.position.distanceTo(entity.position) < 5) {
-          bot.collectBlock.collect(entity).catch(() => {})
+    
+    // Debug: Tìm TẤT CẢ farmland trước
+    const allFarmlands = bot.findBlocks({
+      matching: (block: any) => {
+        return block && block.name === 'farmland'
+      },
+      maxDistance: 32,
+      count: 50
+    })
+    
+    console.log(`🔍 Tìm thấy ${allFarmlands.length} farmland trong phạm vi`)
+    
+    // Kiểm tra từng farmland xem có trống không
+    let emptyCount = 0
+    for (const pos of allFarmlands) {
+      const farmland = bot.blockAt(pos)
+      if (farmland && farmland.position) {
+        const above = bot.blockAt(farmland.position.offset(0, 1, 0))
+        if (above && above.name === 'air') {
+          emptyCount++
         }
       }
-
-      // Pha 3: Kiểm Tra Túi Đồ SAU KHI THU HOẠCH
-      const emptySlots = bot.inventory.emptySlotCount()
-      
-      // Pha 3.5A: Xử Lý Túi Đồ Đầy
-      if (emptySlots <= 0 || emptySlots < 2) {
-        bot.chat('Hành lý đầy! Đang tạm dừng làm nông.')
-        // Bỏ trang bị hoe
-        try {
-          const emptySlot = bot.inventory.slots.find((slot, index) => !slot && index >= 9 && index < 45)
-          if (emptySlot !== undefined && bot.heldItem) {
-            await bot.unequip('hand')
-          }
-        } catch (e) {
-          console.log('Không thể bỏ trang bị hoe')
-        }
-        stopAutoCropFarmer()
-        return
-      }
-
-      // Pha 3.5B: Gieo Trồng Lại (nếu túi chưa đầy)
-      // Tìm hạt giống/củ tương ứng
-      const cropName = matureCrop.name.toLowerCase()
-      let seedsNeeded: any = null
-
-      if (cropName.includes('wheat')) {
-        seedsNeeded = bot.inventory.items().find(item => item.name.includes('wheat_seeds'))
-      } else if (cropName.includes('carrots')) {
-        seedsNeeded = bot.inventory.items().find(item => item.name.includes('carrot'))
-      } else if (cropName.includes('potatoes')) {
-        seedsNeeded = bot.inventory.items().find(item => item.name.includes('potato'))
-      } else if (cropName.includes('beetroots')) {
-        seedsNeeded = bot.inventory.items().find(item => item.name.includes('beetroot_seeds'))
-      }
-
-      if (seedsNeeded && farmlandBlock && farmlandBlock.name === 'farmland') {
-        try {
-          // Trang bị hạt/củ
-          await bot.equip(seedsNeeded, 'hand')
-          
-          // Đặt hạt lên đất đã cuốc
-          await bot.placeBlock(farmlandBlock, new Vec3(0, 1, 0))
-          console.log(`🌱 Đã gieo trồng lại ${seedsNeeded.name}`)
-
-          // Trang bị lại hoe
-          await equipBestHoe()
-        } catch (error) {
-          console.log('❌ Lỗi gieo trồng lại:', error?.message || error)
-        }
-      } else if (!seedsNeeded) {
-        console.log('⚠️ Không có hạt giống để trồng lại')
-      }
-
-      // Pha 2.6: Lặp lại - sẽ tự động lặp lại trong interval
-
-    } catch (error) {
-      console.log('❌ Lỗi trong chu trình farming:', error?.message || error)
-      try { bot.pathfinder.setGoal(null) } catch (e) {}
     }
+    console.log(`🔍 Trong đó có ${emptyCount} farmland trống`)
+    
+    let plantCount = 0
+    let maxPlantAttempts = 100
+    
+    for (let i = 0; i < maxPlantAttempts && autoCropFarmerActive; i++) {
+      // Tìm farmland trống từng cái một
+      let foundEmpty = null
+      
+      for (const pos of allFarmlands) {
+        const farmland = bot.blockAt(pos)
+        if (farmland && farmland.position) {
+          const above = bot.blockAt(farmland.position.offset(0, 1, 0))
+          if (above && above.name === 'air') {
+            foundEmpty = farmland
+            break
+          }
+        }
+      }
+
+      if (!foundEmpty) {
+        console.log(`✅ Không còn đất trống! Đã trồng ${plantCount} cây`)
+        break
+      }
+
+      // Lấy hạt giống
+      const seed = bot.inventory.items().find(item => {
+        return item.name === 'wheat_seeds' || item.name === 'carrot' || 
+               item.name === 'potato' || item.name === 'beetroot_seeds'
+      })
+
+      if (!seed) {
+        console.log('⚠️ Hết hạt giống!')
+        break
+      }
+
+      try {
+        // Di chuyển đến farmland
+        const movements = new Movements(bot)
+        movements.canDig = false
+        bot.pathfinder.setMovements(movements)
+        await bot.pathfinder.goto(new goals.GoalNear(foundEmpty.position.x, foundEmpty.position.y, foundEmpty.position.z, 1))
+
+        // Trang bị và trồng
+        await bot.equip(seed, 'hand')
+        await new Promise(resolve => setTimeout(resolve, 200))
+        await bot.placeBlock(foundEmpty, new Vec3(0, 1, 0))
+        
+        plantCount++
+        console.log(`✅ Trồng ${seed.name} (${plantCount})`)
+        await new Promise(resolve => setTimeout(resolve, 300))
+
+      } catch (error) {
+        console.log('❌ Lỗi trồng:', (error as any)?.message || error)
+      }
+    }
+
+    // ===== PHA 3: BÓN PHÂN (BONE MEAL) =====
+    console.log('💀 === PHA 3: BÓN PHÂN ===')
+    
+    // Kiểm tra có bone meal không
+    const boneMeal = bot.inventory.items().find(item => 
+      item.name === 'bone_meal'
+    )
+    
+    if (!boneMeal) {
+      console.log('⚠️ Không có bone meal - Chờ cây chín...')
+      console.log(`🎉 Chu kỳ hoàn thành! Thu hoạch: ${harvestCount}, Trồng: ${plantCount}`)
+      
+      // Chờ cho đến khi có cây chín
+      let waitCount = 0
+      while (autoCropFarmerActive) {
+        await new Promise(resolve => setTimeout(resolve, 5000)) // Chờ 5 giây
+        waitCount++
+        
+        // Kiểm tra có cây chín không
+        const matureCrops = bot.findBlocks({
+          matching: (block: any) => {
+            if (!block) return false
+            const name = block.name
+            if (name !== 'wheat' && name !== 'carrots' && name !== 'potatoes' && name !== 'beetroots') {
+              return false
+            }
+            return isCropMature(block)
+          },
+          maxDistance: 32,
+          count: 1
+        })
+        
+        if (matureCrops.length > 0) {
+          console.log(`✅ Có cây chín rồi! Quay lại pha 1 (đã chờ ${waitCount * 5}s)`)
+          return // Quay lại pha 1
+        }
+        
+        // Log mỗi 30 giây
+        if (waitCount % 6 === 0) {
+          console.log(`⏳ Đang chờ cây chín... (${waitCount * 5}s)`)
+        }
+      }
+      return
+    }
+    
+    console.log(`💀 Có ${boneMeal.count} bone meal`)
+    
+    let boneMealCount = 0
+    let maxBoneMealAttempts = 200 // Giới hạn cao hơn vì bón nhiều lần
+    
+    for (let i = 0; i < maxBoneMealAttempts && autoCropFarmerActive; i++) {
+      // Kiểm tra còn bone meal không
+      const currentBoneMeal = bot.inventory.items().find(item => item.name === 'bone_meal')
+      if (!currentBoneMeal) {
+        console.log('✅ Hết bone meal!')
+        break
+      }
+      
+      // Tìm cây chưa chín
+      const immatureCrops = bot.findBlocks({
+        matching: (block: any) => {
+          if (!block) return false
+          const name = block.name
+          if (name !== 'wheat' && name !== 'carrots' && name !== 'potatoes' && name !== 'beetroots') {
+            return false
+          }
+          return !isCropMature(block) // Cây CHƯA chín
+        },
+        maxDistance: 32,
+        count: 1
+      })
+
+      if (immatureCrops.length === 0) {
+        console.log(`✅ Không còn cây chưa chín! Đã bón ${boneMealCount} lần`)
+        break
+      }
+
+      const cropPos = immatureCrops[0]
+      const cropBlock = bot.blockAt(cropPos)
+      if (!cropBlock) continue
+
+      try {
+        const movements = new Movements(bot)
+        movements.canDig = false
+        bot.pathfinder.setMovements(movements)
+        await bot.pathfinder.goto(new goals.GoalNear(cropPos.x, cropPos.y, cropPos.z, 3))
+
+        // Trang bị bone meal
+        await bot.equip(currentBoneMeal, 'hand')
+        await new Promise(resolve => setTimeout(resolve, 200))
+        
+        // Bón phân (activateBlock)
+        await bot.activateBlock(cropBlock)
+        boneMealCount++
+        console.log(`💀 Bón phân ${cropBlock.name} (${boneMealCount})`)
+        await new Promise(resolve => setTimeout(resolve, 300))
+
+      } catch (error) {
+        console.log('❌ Lỗi bón phân:', (error as any)?.message || error)
+      }
+    }
+
+    // ===== BÁO CÁO CHU KỲ =====
+    console.log(`🎉 === CHU KỲ HOÀN THÀNH ===`)
+    console.log(`Thu hoạch: ${harvestCount} cây`)
+    console.log(`Trồng lại: ${plantCount} cây`)
+    console.log(`Bón phân: ${boneMealCount} lần`)
+    console.log(`⏳ Quay lại pha 1...`)
   }
 
   // Stop auto crop farming
@@ -6574,14 +7659,11 @@ Hãy trả lời câu hỏi này với phong cách:
       await eatFoodToHeal()
     }
 
-    // Step 2: Scan for structures within 180 blocks
-    await scanForStructures()
-
-    // Step 3: Scan for hostile mobs
+    // Step 2: Scan for hostile mobs TRƯỚC
     const nearestMob = bot.nearestEntity((entity: any) => {
       if (!entity || !entity.position) return false
       const distance = bot.entity.position.distanceTo(entity.position)
-      if (distance > 30) return false // Scan within 30 blocks
+      if (distance > 30) return false
 
       const hostileMobs = [
         'zombie', 'skeleton', 'creeper', 'spider', 'witch', 'pillager', 'vindicator',
@@ -6598,60 +7680,53 @@ Hãy trả lời câu hỏi này với phong cách:
       return entity.type === 'mob' && isHostile
     })
 
-    // Step 4: Combat if mob found and health > 6 (3 hearts)
+    // Step 3: Combat if mob found and health > 6
     if (nearestMob && health > 6) {
       const distance = bot.entity.position.distanceTo(nearestMob.position)
       console.log(`⚔️ Phát hiện ${nearestMob.name || 'mob'} cách ${distance.toFixed(1)}m, đánh quái!`)
 
-      // Equip weapon
       await equipBestSword()
 
-      // Move towards mob
       const movements = new Movements(bot)
       movements.allowSprinting = true
+      movements.canDig = false
       bot.pathfinder.setMovements(movements)
 
       try {
         await bot.pathfinder.goto(new goals.GoalNear(nearestMob.position.x, nearestMob.position.y, nearestMob.position.z, 2))
-
-        // Attack mob
         bot.pvp.attack(nearestMob)
-
-        // Wait for combat to finish
         await new Promise(resolve => setTimeout(resolve, 3000))
-
         bot.pvp.stop()
-        console.log('✅ Đã tiêu diệt quái, tiếp tục khám phá')
+        console.log('✅ Đã tiêu diệt quái')
       } catch (error) {
-        console.log('⚠️ Lỗi khi đánh quái:', error?.message || error)
+        console.log('⚠️ Lỗi combat:', (error as any)?.message || error)
       }
 
       return
     } else if (nearestMob && health <= 6) {
-      console.log(`⚠️ Máu yếu (${health}/20), tránh quái ${nearestMob.name || 'mob'}`)
+      console.log(`⚠️ Máu yếu (${health}/20), tránh quái`)
     }
 
-    // Step 5: Continue exploring in chosen direction
-    const now = Date.now()
-    if (now - lastExploreMove > 5000) { // Move every 5 seconds
-      lastExploreMove = now
+    // Step 4: Scan for structures (không chặn di chuyển)
+    scanForStructures().catch(() => {})
 
-      const currentPos = bot.entity.position
-      const distance = 40 + Math.random() * 40 // 40-80 blocks
+    // Step 5: DI CHUYỂN LIÊN TỤC (bỏ check lastExploreMove)
+    const currentPos = bot.entity.position
+    const distance = 50 // Di chuyển 50 blocks mỗi lần
 
-      const targetX = currentPos.x + exploreDirection!.x * distance
-      const targetZ = currentPos.z + exploreDirection!.z * distance
+    const targetX = currentPos.x + exploreDirection!.x * distance
+    const targetZ = currentPos.z + exploreDirection!.z * distance
 
-      const movements = new Movements(bot)
-      movements.canDig = true
-      movements.allowSprinting = true
-      bot.pathfinder.setMovements(movements)
+    console.log(`🚶 Khám phá đến (${Math.floor(targetX)}, ${Math.floor(targetZ)})`)
 
-      const goal = new goals.GoalXZ(targetX, targetZ)
-      bot.pathfinder.setGoal(goal)
+    const movements = new Movements(bot)
+    movements.canDig = false
+    movements.allowSprinting = true
+    movements.allowParkour = true
+    bot.pathfinder.setMovements(movements)
 
-      console.log(`🚶 Di chuyển đến (${Math.floor(targetX)}, ${Math.floor(targetZ)})`)
-    }
+    const goal = new goals.GoalXZ(targetX, targetZ)
+    bot.pathfinder.setGoal(goal)
   }
 
   // Scan for structures
@@ -6723,6 +7798,265 @@ Hãy trả lời câu hỏi này với phong cách:
     console.log('⏹️ Auto Explore - Deactivated')
   }
 
+  // ============= AUTO COLLECT (GỖ, HẠT GIỐNG, V.V.) =============
+  
+  startAutoCollect = function() {
+    // Dừng các hoạt động khác
+    stopFollowing()
+    stopProtecting()
+    if (autoFishingActive) stopSmartAutoFishing()
+    if (autoFarmActive) stopAutoFarm()
+    if (autoMiningActive) stopAutoMining()
+    if (autoCropFarmerActive) stopAutoCropFarmer()
+    if (autoChestHuntingActive) stopAutoChestHunting()
+    if (autoExploreActive) stopAutoExplore()
+
+    autoCollectActive = true
+    bot.chat('🌳 Bắt đầu auto thu thập! Tớ sẽ tìm gỗ, hạt giống và vật phẩm!')
+    console.log('🌳 Auto Collect - Activated')
+
+    if (collectInterval) {
+      clearInterval(collectInterval)
+    }
+
+    collectInterval = setInterval(async () => {
+      if (!autoCollectActive) {
+        clearInterval(collectInterval!)
+        collectInterval = null
+        return
+      }
+
+      try {
+        await executeCollectCycle()
+      } catch (error) {
+        console.log('❌ Lỗi auto collect:', error)
+        bot.pathfinder.setGoal(null)
+      }
+    }, 2000) // Kiểm tra mỗi 2 giây
+  }
+
+  async function executeCollectCycle() {
+    if (!autoCollectActive) return
+
+    const currentTime = Date.now()
+
+    // Bước 1: Tìm gỗ gần nhất
+    const logBlock = bot.findBlock({
+      matching: (block) => {
+        if (!block) return false
+        const name = block.name.toLowerCase()
+        return name.includes('log') || name.includes('wood')
+      },
+      maxDistance: 32,
+      count: 1
+    })
+
+    if (logBlock) {
+      // Log chỉ mỗi 10 giây để tránh spam
+      if (currentTime - lastCollectLog > 10000) {
+        console.log(`🌳 Tìm thấy gỗ tại ${logBlock.position}`)
+        lastCollectLog = currentTime
+      }
+
+      // Di chuyển đến và đào gỗ
+      const movements = new Movements(bot)
+      movements.canDig = true
+      movements.allowSprinting = true
+      bot.pathfinder.setMovements(movements)
+
+      try {
+        // Trang bị rìu tốt nhất
+        await equipBestAxe()
+        
+        // Đào gỗ
+        await bot.collectBlock.collect(logBlock)
+        console.log(`✅ Đã thu thập ${logBlock.name}`)
+        
+        // Đợi một chút trước khi tìm tiếp
+        await new Promise(resolve => setTimeout(resolve, 500))
+        return
+      } catch (error) {
+        // Bỏ qua lỗi, tìm block khác
+      }
+    }
+
+    // Bước 2: Tìm hạt giống (wheat, carrots, potatoes, beetroot)
+    const cropBlock = bot.findBlock({
+      matching: (block) => {
+        if (!block) return false
+        const name = block.name.toLowerCase()
+        // Chỉ thu hoạch khi chín (age = 7)
+        return (name === 'wheat' || name === 'carrots' || name === 'potatoes' || name === 'beetroots') &&
+               block.metadata === 7
+      },
+      maxDistance: 32,
+      count: 1
+    })
+
+    if (cropBlock) {
+      if (currentTime - lastCollectLog > 10000) {
+        console.log(`🌾 Tìm thấy cây trồng chín tại ${cropBlock.position}`)
+        lastCollectLog = currentTime
+      }
+
+      try {
+        await bot.collectBlock.collect(cropBlock)
+        console.log(`✅ Đã thu hoạch ${cropBlock.name}`)
+        await new Promise(resolve => setTimeout(resolve, 500))
+        return
+      } catch (error) {
+        // Bỏ qua lỗi
+      }
+    }
+
+    // Bước 3: Tìm item entities gần đó
+    const nearbyItems = Object.values(bot.entities).filter(entity => 
+      entity.name === 'item' && 
+      entity.position && 
+      bot.entity.position.distanceTo(entity.position) < 16
+    )
+
+    if (nearbyItems.length > 0) {
+      const closestItem = nearbyItems[0]
+      if (currentTime - lastCollectLog > 10000) {
+        console.log(`🎁 Tìm thấy ${nearbyItems.length} vật phẩm gần đó`)
+        lastCollectLog = currentTime
+      }
+
+      try {
+        await bot.collectBlock.collect(closestItem)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        return
+      } catch (error) {
+        // Bỏ qua lỗi
+      }
+    }
+
+    // Bước 4: Lang thang tìm kiếm nếu không có gì
+    const randomAngle = Math.random() * Math.PI * 2
+    const distance = 20
+    const targetX = bot.entity.position.x + Math.cos(randomAngle) * distance
+    const targetZ = bot.entity.position.z + Math.sin(randomAngle) * distance
+
+    if (currentTime - lastCollectLog > 15000) {
+      console.log(`🚶 Lang thang tìm kiếm...`)
+      lastCollectLog = currentTime
+    }
+
+    const movements = new Movements(bot)
+    movements.canDig = false
+    movements.allowSprinting = true
+    bot.pathfinder.setMovements(movements)
+
+    const goal = new goals.GoalXZ(targetX, targetZ)
+    bot.pathfinder.setGoal(goal)
+
+    // Đợi 3 giây trước khi tìm tiếp
+    await new Promise(resolve => setTimeout(resolve, 3000))
+  }
+
+  // Hàm trang bị rìu tốt nhất
+  async function equipBestAxe() {
+    try {
+      if (!bot.inventory) return
+
+      const axes = bot.inventory.items().filter(item => item.name.includes('axe'))
+      if (axes.length === 0) return
+
+      const bestAxe = axes.sort((a, b) => {
+        const getTier = (name: string) => {
+          if (name.includes('netherite')) return 10
+          if (name.includes('diamond')) return 8
+          if (name.includes('iron')) return 6
+          if (name.includes('stone')) return 4
+          if (name.includes('wooden') || name.includes('wood')) return 2
+          return 1
+        }
+        return getTier(b.name) - getTier(a.name)
+      })[0]
+
+      if (!bot.heldItem || bot.heldItem.name !== bestAxe.name) {
+        await bot.equip(bestAxe, 'hand')
+        console.log(`🪓 Trang bị ${bestAxe.name}`)
+      }
+    } catch (error) {
+      // Bỏ qua lỗi
+    }
+  }
+
+  stopAutoCollect = function() {
+    autoCollectActive = false
+
+    if (collectInterval) {
+      clearInterval(collectInterval)
+      collectInterval = null
+    }
+
+    try {
+      bot.pathfinder.setGoal(null)
+    } catch (error) {
+      // Ignore
+    }
+
+    bot.chat('🌳 Dừng auto thu thập!')
+    console.log('⏹️ Auto Collect - Deactivated')
+  }
+
+  // ============= GO HOME (QUAY VỀ SPAWN POINT) =============
+  
+  goHome = function() {
+    if (!spawnPoint) {
+      bot.chat('🥺 Tớ chưa lưu spawn point! Hãy đợi tớ spawn lần đầu.')
+      console.log('❌ Spawn point chưa được lưu')
+      return
+    }
+
+    // Dừng tất cả hoạt động
+    stopFollowing()
+    stopProtecting()
+    if (autoFishingActive) stopSmartAutoFishing()
+    if (autoFarmActive) stopAutoFarm()
+    if (autoMiningActive) stopAutoMining()
+    if (autoCropFarmerActive) stopAutoCropFarmer()
+    if (autoChestHuntingActive) stopAutoChestHunting()
+    if (autoExploreActive) stopAutoExplore()
+    if (autoCollectActive) stopAutoCollect()
+
+    const distance = bot.entity.position.distanceTo(spawnPoint)
+    bot.chat(`🏠 Đang về nhà! Cách ${Math.floor(distance)}m`)
+    console.log(`🏠 Quay về spawn point: ${Math.floor(spawnPoint.x)}, ${Math.floor(spawnPoint.y)}, ${Math.floor(spawnPoint.z)}`)
+
+    // Sử dụng pathfinder để di chuyển về spawn
+    const movements = createSmartMovements()
+    movements.allowSprinting = true
+    movements.allowParkour = true
+    bot.pathfinder.setMovements(movements)
+
+    const goal = new goals.GoalNear(spawnPoint.x, spawnPoint.y, spawnPoint.z, 2)
+    bot.pathfinder.setGoal(goal)
+
+    // Kiểm tra khi đến nơi bằng interval
+    const checkArrival = setInterval(() => {
+      if (!spawnPoint) {
+        clearInterval(checkArrival)
+        return
+      }
+
+      const currentDistance = bot.entity.position.distanceTo(spawnPoint)
+      if (currentDistance < 3) {
+        bot.chat('🏠 Đã về đến nhà rồi!')
+        console.log('✅ Đã về spawn point')
+        clearInterval(checkArrival)
+        bot.pathfinder.setGoal(null)
+      }
+    }, 1000) // Kiểm tra mỗi giây
+
+    // Timeout sau 60 giây
+    setTimeout(() => {
+      clearInterval(checkArrival)
+    }, 60000)
+  }
+
   // Heartbeat để duy trì connection - cải thiện với error handling
   setInterval(() => {
     if (bot && bot._client && bot._client.state === 'play') {
@@ -6742,8 +8076,9 @@ Hãy trả lời câu hỏi này với phong cách:
         }
       } catch (error) {
         // Chỉ log lỗi heartbeat nếu không phải EPIPE
-        if (!error.message?.includes('EPIPE')) {
-          console.log('⚠️ Heartbeat warning:', error.message || error)
+        const err = error as any
+        if (!err.message?.includes('EPIPE')) {
+          console.log('⚠️ Heartbeat warning:', err.message || error)
         }
       }
     }
@@ -6808,7 +8143,7 @@ Hãy trả lời câu hỏi này với phong cách:
         }
       } catch (error) {
         presenceCheckFailures++
-        console.log(`⚠️ Bot presence check error (${presenceCheckFailures}/${MAX_PRESENCE_FAILURES}):`, error.message || error)
+        console.log(`⚠️ Bot presence check error (${presenceCheckFailures}/${MAX_PRESENCE_FAILURES}):`, (error as Error).message || error)
       }
     }
 
@@ -6835,12 +8170,25 @@ Hãy trả lời câu hỏi này với phong cách:
       action()
       return true
     } catch (error) {
-      if (!error.message?.includes('EPIPE')) {
-        console.log(`⚠️ Lỗi ${actionName}:`, error.message || error)
+      const err = error as any
+      if (!err.message?.includes('EPIPE')) {
+        console.log(`⚠️ Lỗi ${actionName}:`, err.message || error)
       }
       return false
     }
   }
+
+  // Handle kick events to see why bot is being disconnected
+  bot.on('kicked', (reason: string) => {
+    console.log('⚠️ Bot bị kick khỏi server!')
+    console.log('📋 Lý do kick:', reason)
+    try {
+      const reasonObj = JSON.parse(reason)
+      console.log('📋 Chi tiết kick:', JSON.stringify(reasonObj, null, 2))
+    } catch {
+      console.log('📋 Raw kick reason:', reason)
+    }
+  })
 
   // Error handling với improved EPIPE handling và auto-reconnect
   bot.on('error', (err: any) => {
@@ -6869,9 +8217,9 @@ Hãy trả lời câu hỏi này với phong cách:
     if (networkErrors.some(errType => errorMessage.includes(errType)) ||
         serverErrors.some(errType => errorMessage.includes(errType))) {
       // Chỉ log EPIPE warning một lần
-      if (errorMessage.includes('EPIPE') && !bot._epipeWarned) {
+      if (errorMessage.includes('EPIPE') && !(bot as any)._epipeWarned) {
         console.log('⚠️ Kết nối bị ngắt (EPIPE), sẽ auto-reconnect...')
-        bot._epipeWarned = true
+        ;(bot as any)._epipeWarned = true
       }
 
       // Cleanup safely để tránh thêm EPIPE errors
@@ -6954,7 +8302,7 @@ Hãy trả lời câu hỏi này với phong cách:
       console.log('🔄 Reset prismarine viewer setup flag for future connections')
 
     } catch (cleanupError) {
-      console.log('⚠️ Lỗi cleanup khi disconnect:', cleanupError.message)
+      console.log('⚠️ Lỗi cleanup khi disconnect:', (cleanupError as Error).message || cleanupError)
     }
 
     // Cập nhật bot status cho web interface

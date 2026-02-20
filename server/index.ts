@@ -86,12 +86,12 @@ app.use((req, res, next) => {
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
   const port = parseInt(process.env.PORT || '5000', 10);
+  const host = process.platform === 'win32' ? 'localhost' : '0.0.0.0';
   server.listen({
     port,
-    host: "0.0.0.0",
-    reusePort: true,
+    host,
   }, () => {
-    log(`🌐 Server đang chạy tại: http://0.0.0.0:${port}`);
+    log(`🌐 Server đang chạy tại: http://${host}:${port}`);
     log(`🎮 Preview URL: https://${process.env.REPL_SLUG || 'workspace'}.${process.env.REPL_OWNER || 'user'}.repl.co`);
   });
 })();

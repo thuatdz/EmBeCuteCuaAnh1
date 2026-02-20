@@ -5,8 +5,6 @@ export interface BotConfig {
   username: string
   version: string
   auth: 'microsoft' | 'offline'
-  skinUrl?: string
-  capeUrl?: string
 }
 
 export interface BotState {

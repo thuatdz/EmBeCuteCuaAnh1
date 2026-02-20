@@ -1,0 +1,5 @@
+# Danh sách người chơi được phép điều khiển bot
+# Mỗi dòng là một tên người chơi
+# Bot sẽ so sánh tên với độ tương đồng 98%
+
+namgt68
