@@ -72,27 +72,27 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  // WebSocket setup for console
-  const wss = new WebSocketServer({
-    port: 8080,
-    host: '0.0.0.0',
-    perMessageDeflate: false,
-    clientTracking: true
-  });
-
-
   // ALWAYS serve the app on the port specified in the environment variable PORT
   // Other ports are firewalled. Default to 5000 if not specified.
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
   const port = parseInt(process.env.PORT || '5000', 10);
   const host = process.platform === 'win32' ? 'localhost' : '0.0.0.0';
+  
   server.listen({
     port,
     host,
   }, () => {
     log(`🌐 Server đang chạy tại: http://${host}:${port}`);
     log(`🎮 Preview URL: https://${process.env.REPL_SLUG || 'workspace'}.${process.env.REPL_OWNER || 'user'}.repl.co`);
+  });
+
+  // WebSocket setup for console - attach to existing HTTP server instead of creating new port
+  const wss = new WebSocketServer({
+    server: server,
+    path: '/ws',
+    perMessageDeflate: false,
+    clientTracking: true
   });
 })();
 

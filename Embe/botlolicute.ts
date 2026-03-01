@@ -40,7 +40,7 @@ import * as fs from 'fs'
 // Import các module đã tách
 import { BotConfig, BotState } from './types'
 import { updateBotStatus, setBotConnected, getBotStatus } from './bot-status'
-import { initFacebookBot, sendFbMessage, replyFbMessage, closeFacebookBot } from './botmess'
+import { initFacebookPage, notifyOwner, closeFacebookPage } from './facebook-page'
 const { mineflayer: mineflayerViewer } = require('prismarine-viewer')
 
 const groqApiKey = process.env.GROQ_API_KEY // Groq API key (Free, Fast LLM)
@@ -413,13 +413,20 @@ async function createBot() {
   // Tăng MaxListeners để tránh warning
   bot.setMaxListeners(100)
 
-  // patch chat method so we can globally silence it
-  const originalChat = bot.chat.bind(bot as any)
-  bot.chat = (message: string) => {
-    if (chatEnabled) {
-      try { originalChat(message) } catch {};
+  // patch chat method so we can globally silence it (after bot is ready)
+  let originalChat: ((message: string) => void) | null = null
+  
+  // Wait for bot to be ready before patching chat
+  bot.once('login', () => {
+    if (bot.chat) {
+      originalChat = bot.chat.bind(bot as any)
+      bot.chat = (message: string) => {
+        if (chatEnabled && originalChat) {
+          try { originalChat(message) } catch {};
+        }
+      }
     }
-  }
+  })
 
   // Setup real prismarine-viewer for 3D world viewing with dedicated host
   async function setupPrismarineViewer() {
@@ -752,15 +759,17 @@ async function createBot() {
         // Kiểm tra quyền /tp một lần duy nhất
         setTimeout(() => checkTpPermissionOnce(), 8000)
 
-        // Khởi tạo Facebook bot (nếu cấu hình sẵn)
+        // Khởi tạo Facebook Page (nếu cấu hình sẵn)
         setTimeout(async () => {
-          const fbConnected = await initFacebookBot()
+          const fbConnected = await initFacebookPage()
           if (fbConnected) {
-            console.log('✅ Facebook bot đã kết nối thành công')
-            // Gửi thông báo tới Facebook owner
-            await sendFbMessage(process.env.FB_OWNER_ID || '', '🎮 Bot Minecraft đã online, sẵn sàng chat!')
+            console.log('✅ Facebook Page đã kết nối thành công')
+            // Gửi thông báo chi tiết tới Facebook Page
+            const serverInfo = `${BOT_CONFIG.host}:${BOT_CONFIG.port}`
+            const botName = BOT_CONFIG.username
+            await notifyOwner(`✅ Bot "${botName}" đã kết nối thành công!\n🌍 Server: ${serverInfo}\n⏰ Thời gian: ${new Date().toLocaleString('vi-VN')}`)
           } else {
-            console.log('⚠️ Không thể kết nối Facebook, tiếp tục chạy Minecraft bot')
+            console.log('⚠️ Không thể kết nối Facebook Page, tiếp tục chạy Minecraft bot')
           }
         }, 9000)
 
@@ -4645,7 +4654,7 @@ Chỉ trả về JSON, không giải thích thêm.`
       } else if (cleanMessage.includes('auto farm all') || cleanMessage.includes('farm')) {
         if (autoFishingActive) stopAutoFishing() // Dừng câu khi có lệnh khác
         autoFarmManager.startAutoFarmAll()
-      } else if (cleanMessage.startsWith('tớ hỏi nè')) {
+      } else if (cleanMessage.includes('bot')) {
         handleQuestionWithAI(username, message)
       } else if (cleanMessage.includes('auto câu') || cleanMessage.includes('fishing')) {
         startSmartAutoFishing()
@@ -4775,8 +4784,8 @@ Chỉ trả về JSON, không giải thích thêm.`
         // Chức năng enchant công cụ
         const toolName = message.substring(3).trim()
         await handleEnchantTool(username, toolName)
-      } else if (!isCommand(cleanMessage)) {
-        // Chat thường không phải lệnh - sử dụng AI để trả lời
+      } else if (!isCommand(cleanMessage) && cleanMessage.includes('bot')) {
+        // Chat có từ "bot" - sử dụng AI để trả lời
         console.log(`🧠 Đang suy nghĩ để trả lời chat: "${message}"`)
         await handleChatWithAI(username, message)
       }
@@ -5068,23 +5077,13 @@ Chỉ trả về JSON, không giải thích thêm.`
       return
     }
 
-    // Cooldown 3 phút (180 giây)
-    const now = Date.now()
-    const cooldownTime = 180000 // 3 phút = 180000ms
-    
-    if (now - lastAIChatTime < cooldownTime) {
-      const remainingTime = Math.ceil((cooldownTime - (now - lastAIChatTime)) / 1000)
-      console.log(`⏳ AI cooldown: còn ${remainingTime}s`)
-      return // Im lặng, không trả lời
-    }
-
     try {
       console.log(`🤖 Groq AI đang phân tích chat từ ${username}: "${message}"`)
 
       const systemPrompt = `Bạn là bot Minecraft tên ice.
 
 Phong cách trả lời:
-- Xưng tôi, gọi bạn
+- Xưng tớ, gọi cậu
 - Không dùng emoji
 - Trả lời bình thường, tự nhiên
 - Dưới 100 ký tự để chat game không bị cắt
@@ -5097,9 +5096,6 @@ Phong cách trả lời:
         const aiResponse = generatedText.substring(0, 100)
         bot.chat(aiResponse)
         console.log(`💬 Groq AI đã trả lời: "${aiResponse}"`)
-        
-        // Cập nhật thời gian chat cuối
-        lastAIChatTime = now
       } else {
         console.log(`🤖 Groq AI không có phản hồi`)
       }
@@ -5114,23 +5110,13 @@ Phong cách trả lời:
       return
     }
 
-    // Cooldown 3 phút
-    const now = Date.now()
-    const cooldownTime = 180000
-    
-    if (now - lastAIChatTime < cooldownTime) {
-      const remainingTime = Math.ceil((cooldownTime - (now - lastAIChatTime)) / 1000)
-      console.log(`⏳ AI cooldown: còn ${remainingTime}s`)
-      return
-    }
-
     try {
-      const question = message.replace(/tớ hỏi nè/i, '').trim()
+      const question = message.replace(/bot/i, '').trim()
       const systemPrompt = `Bạn là bot Minecraft tên ice.
 
 Trả lời câu hỏi:
 - Ngắn gọn, súc tích (dưới 100 ký tự)
-- Xưng tôi, gọi bạn
+- Xưng tớ, gọi cậu
 - Không dùng emoji
 - Trả lời bình thường, tự nhiên
 - Nếu không biết, thừa nhận thẳng thắn`
@@ -5140,7 +5126,6 @@ Trả lời câu hỏi:
       if (generatedText && generatedText.trim() !== '') {
         const aiResponse = generatedText.substring(0, 100)
         bot.chat(aiResponse)
-        lastAIChatTime = now
       } else {
         console.log('⚠️ No AI available for question')
       }
@@ -5702,7 +5687,7 @@ Trả lời câu hỏi:
         }
       }
 
-      // Tìm quái gần nhất - CHỈ NHỮNG CON NHÌN THẤY (không xuyên tường)
+      // Tìm quái gần nhất - BỎ KIỂM TRA LINE OF SIGHT (cho phép xuyên tường)
       let mob = bot.nearestEntity((entity: any) => {
         if (!entity || !entity.position) return false
 
@@ -5725,20 +5710,15 @@ Trả lời câu hỏi:
                          !mobName.includes('villager') &&
                          !mobName.includes('iron_golem')
 
-        // KIỂM TRA LINE OF SIGHT - CHỈ TẤN CÔNG QUÁI NHÌN THẤY
+        // BỎ KIỂM TRA LINE OF SIGHT - CHO PHÉP NHÌN VÀ ĐÁNH XUYÊN TƯỜNG
         if (isHostile || isMobType) {
-          // Sử dụng hàm hasLineOfSight để kiểm tra chính xác
-          if (!hasLineOfSight(entity)) {
-            return false // Có tường chắn, bỏ qua mob này
-          }
-          
           return true
         }
 
         return false
       })
 
-      // KIỂM TRA CREEPER GẦN VÀ CHỐNG KHIÊN - ƯU TIÊN CAO NHẤT (cũng cần line of sight)
+      // KIỂM TRA CREEPER GẦN VÀ CHỐNG KHIÊN - ƯU TIÊN CAO NHẤT (bỏ line of sight check)
       const nearbyCreeper = bot.nearestEntity((entity: any) => {
         if (!entity || !entity.position) return false
         const mobName = entity.name ? entity.name.toLowerCase() : ''
@@ -5746,10 +5726,7 @@ Trả lời câu hỏi:
         const isCreeper = (mobName.includes('creeper') || displayName.includes('creeper'))
         
         if (isCreeper) {
-          // Kiểm tra line of sight cho Creeper
-          if (!hasLineOfSight(entity)) {
-            return false // Creeper bị tường chắn, bỏ qua
-          }
+          // BỎ KIỂM TRA LINE OF SIGHT - CHO PHÉP PHÁT HIỆN CREEPER XUYÊN TƯỜNG
           return true
         }
         
