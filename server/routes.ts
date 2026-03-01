@@ -320,6 +320,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/ping", (req, res) => {
     res.status(200).send("pong");
   });
+  
 
   // Route "Xem Bot" chuyên dụng với tích hợp prismarine-viewer
   app.get("/xem-bot", (req, res) => {

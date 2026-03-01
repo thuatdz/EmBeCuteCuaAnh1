@@ -12,6 +12,21 @@ import mineflayer, { Bot } from 'mineflayer'
 import { pathfinder, Movements } from 'mineflayer-pathfinder'
 import * as net from 'net'
 
+// helper to check if a TCP port is free without actually starting the viewer
+async function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const tester = net.createServer()
+      .once('error', () => {
+        resolve(false)
+      })
+      .once('listening', () => {
+        tester.close()
+        resolve(true)
+      })
+      .listen(port, '0.0.0.0')
+  })
+}
+
 // Import goals using createRequire for CommonJS module
 import { createRequire } from 'module'
 const require = createRequire(import.meta.url)
@@ -25,6 +40,7 @@ import * as fs from 'fs'
 // Import các module đã tách
 import { BotConfig, BotState } from './types'
 import { updateBotStatus, setBotConnected, getBotStatus } from './bot-status'
+import { initFacebookBot, sendFbMessage, replyFbMessage, closeFacebookBot } from './botmess'
 const { mineflayer: mineflayerViewer } = require('prismarine-viewer')
 
 const groqApiKey = process.env.GROQ_API_KEY // Groq API key (Free, Fast LLM)
@@ -76,9 +92,15 @@ let miningInterval: NodeJS.Timeout | null = null
 let lastMinedPosition: any = null
 let isCurrentlyDigging = false
 
-// Auto eat plugin variables
-let autoEatPluginActive = false // Track trạng thái auto eat plugin
+// Auto eat plugin variables (plugin no longer auto-starts)
+let autoEatPluginActive = false // Track trạng thái auto eat plugin (kept for compatibility)
 let lastMobCheckTime = 0 // Track lần cuối kiểm tra mob xung quanh
+
+// Chat/eating control variables (new requirements)
+let chatEnabled = true               // nếu false, bot sẽ im lặng mọi chat
+let hungerAlertSent = false          // đã gửi cảnh báo "em đói" chưa
+let autoEatModeActive = false        // chế độ auto ăn bật hay tắt
+let autoEatInterval: NodeJS.Timeout | null = null // interval khi auto ăn bật
 
 // Auto chest hunting variables
 let autoChestHuntingActive = false
@@ -307,7 +329,7 @@ function createManagerShims() {
   }
 
   autoEatManager = {
-    setup: () => {}, // Removed
+    setup: () => {}, // Removed - auto eat now on-demand via chat command
     disable: () => {} // Removed
   }
 
@@ -391,8 +413,16 @@ async function createBot() {
   // Tăng MaxListeners để tránh warning
   bot.setMaxListeners(100)
 
+  // patch chat method so we can globally silence it
+  const originalChat = bot.chat.bind(bot as any)
+  bot.chat = (message: string) => {
+    if (chatEnabled) {
+      try { originalChat(message) } catch {};
+    }
+  }
+
   // Setup real prismarine-viewer for 3D world viewing with dedicated host
-  function setupPrismarineViewer() {
+  async function setupPrismarineViewer() {
     // Prevent multiple setups
     if (prismarineViewerSetup) {
       console.log('⚠️ Prismarine viewer already set up, skipping...')
@@ -423,15 +453,24 @@ async function createBot() {
         // Try ports starting from 3005 to avoid conflicts
         const tryPorts = [3005, 3006, 3007, 3008, 3009]
         let viewerStarted = false
+        let chosenPort: number | null = null
 
         for (const tryPort of tryPorts) {
           if (viewerStarted) break
 
+          // first ensure port is free before invoking external library
+          const free = await isPortAvailable(tryPort)
+          if (!free) {
+            console.log(`❌ Port ${tryPort} already in use, skipping`) 
+            continue
+          }
+
           try {
-            console.log(`🔍 Trying to start prismarine-viewer on port ${tryPort}...`)
+            console.log(`🔍 Attempting to start prismarine-viewer on port ${tryPort}...`)
 
             // Start real prismarine-viewer with dynamic port
-            const viewer = mineflayerViewer(bot, {
+            // note: this function does not return anything useful, errors may fire later
+            mineflayerViewer(bot, {
               port: tryPort,
               firstPerson: false,
               host: '0.0.0.0',  // Bind to all interfaces for Replit
@@ -440,68 +479,39 @@ async function createBot() {
               outputTextToConsole: false
             })
 
-            // Store viewer instance for cleanup
-            prismarineViewerInstance = viewer
+            // keep track of the instance (mineflayer-viewer returns undefined)
             viewerStarted = true
+            chosenPort = tryPort
 
-            console.log(`✅ Prismarine viewer started successfully on port ${tryPort}!`)
+            console.log(`✅ Prismarine viewer initialized on port ${tryPort}`)
 
-            // Setup viewer with enhanced options
-            if (viewer && typeof viewer.on === 'function') {
-              viewer.on('listening', () => {
-                console.log(`✅ Real Prismarine Viewer đã khởi động trên port ${tryPort}!`)
-                console.log(`🌍 Có thể xem thế giới Minecraft 3D tại: http://0.0.0.0:${tryPort}`)
-
-                // Notify web interface about viewer URL with dynamic port
-                const viewerUrl = `https://${process.env.REPL_SLUG || 'workspace'}-${process.env.REPL_OWNER || 'xihobel480'}.replit.dev:${tryPort}`
-                console.log(`🎮 External Viewer URL: ${viewerUrl}`)
-
-                // Send viewer URL to main web interface
-                fetch('http://localhost:5000/api/bot-viewer-url', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    url: viewerUrl,
-                    port: tryPort,
-                    status: 'active',
-                    botId: 'botlolicute'
-                  })
-                }).catch(() => {})
-
-                // Không chat để tránh spam
-              })
-
-              viewer.on('error', (error: any) => {
-                console.log(`❌ Lỗi Real Prismarine Viewer trên port ${tryPort}:`, error.message)
-                // Try next port
+            // since we don't receive the http object, guard the event on bot.viewer instead
+            if (prismarineViewerInstance && typeof prismarineViewerInstance.on === 'function') {
+              prismarineViewerInstance.on('error', (error: any) => {
+                console.log(`❌ Prismarine-viewer emitted error:`, error?.message || error)
+                // if the error is address in use, we'll attempt next port on reconnect
                 prismarineViewerInstance = null
+                viewerStarted = false
               })
-            } else {
-              console.log('⚠️ Prismarine viewer không hỗ trợ events, chỉ khởi động cơ bản')
-              console.log(`✅ Real Prismarine Viewer đã khởi động trên port ${tryPort}!`)
-
-              // Still try to notify web interface
-              const viewerUrl = `https://${process.env.REPL_SLUG || 'workspace'}-${process.env.REPL_OWNER || 'xihobel480'}.replit.dev:${tryPort}`
-              console.log(`🎮 External Viewer URL: ${viewerUrl}`)
-
-              fetch('http://localhost:5000/api/bot-viewer-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  url: viewerUrl,
-                  port: tryPort,
-                  status: 'active',
-                  botId: 'botlolicute'
-                })
-              }).catch(() => {})
-
-              // Không chat để tránh spam
             }
 
-            break // Successfully started, exit port loop
+            // once the internal http server is listening it'll log itself; we can still notify
+            const viewerUrl = `https://${process.env.REPL_SLUG || 'workspace'}-${process.env.REPL_OWNER || 'xihobel480'}.replit.dev:${tryPort}`
+            console.log(`🎮 External Viewer URL: ${viewerUrl}`)
+            fetch('http://localhost:5000/api/bot-viewer-url', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                url: viewerUrl,
+                port: tryPort,
+                status: 'active',
+                botId: 'botlolicute'
+              })
+            }).catch(() => {})
 
+            break // exit the loop after starting
           } catch (portError: any) {
-            console.log(`❌ Port ${tryPort} busy, trying next port...`)
+            console.log(`❌ Failed to start on ${tryPort}:`, portError.message || portError)
             prismarineViewerInstance = null
             continue
           }
@@ -511,6 +521,9 @@ async function createBot() {
           console.log('❌ Không thể khởi động prismarine-viewer trên bất kỳ port nào, dùng fallback')
           throw new Error('All ports busy for prismarine-viewer')
         }
+
+        // final log with actual port used
+        console.log(`✅ Real Prismarine Viewer setup hoàn tất trên port ${chosenPort}`)
       } else {
         console.log('❌ mineflayerViewer không khả dụng, sử dụng fallback')
         throw new Error('mineflayerViewer not available')
@@ -519,8 +532,6 @@ async function createBot() {
       // Keep bot view tracking for web interface
       startBotViewTracking()
       setupBotEnvironmentTracking()
-
-      console.log('✅ Real Prismarine Viewer setup hoàn tất trên port 3001!')
     } catch (error) {
       console.log('⚠️ Lỗi khởi động Real Prismarine Viewer:', error)
       // Fallback: chỉ chạy basic tracking
@@ -678,15 +689,10 @@ async function createBot() {
     bot.loadPlugin(pvp)
     bot.loadPlugin(collectBlock)
 
-    // Load auto-eat plugin với kiểm tra
-    if (typeof autoEat === 'function') {
-      bot.loadPlugin(autoEat)
-      console.log('✅ Auto-eat plugin loaded successfully')
-    } else {
-      console.log('⚠️ Auto-eat plugin not available, skipping...')
-    }
+    // note: auto-eat plugin is not loaded by default anymore
+    // it will be loaded on demand when "auto eat" command is used
 
-    console.log('✅ Plugins loaded successfully')
+    console.log('✅ Plugins loaded successfully (auto-eat deferred)')
   } catch (pluginError) {
     console.log('⚠️ Warning loading plugins:', pluginError)
   }
@@ -737,14 +743,26 @@ async function createBot() {
         // Xử lý respawn sau khi bot đã ổn định
         setTimeout(() => handleRespawn(), 5000)
 
-        // Khởi động prismarine-viewer trên port 3001
-        setTimeout(() => setupPrismarineViewer(), 6000)
+        // Khởi động prismarine-viewer (asynchronous, sẽ tự chọn port)
+        setTimeout(() => { void setupPrismarineViewer() }, 6000)
 
         // Start monitoring player list to ensure bot is actually in server
         setTimeout(() => startPlayerListMonitoring(), 7000)
 
         // Kiểm tra quyền /tp một lần duy nhất
         setTimeout(() => checkTpPermissionOnce(), 8000)
+
+        // Khởi tạo Facebook bot (nếu cấu hình sẵn)
+        setTimeout(async () => {
+          const fbConnected = await initFacebookBot()
+          if (fbConnected) {
+            console.log('✅ Facebook bot đã kết nối thành công')
+            // Gửi thông báo tới Facebook owner
+            await sendFbMessage(process.env.FB_OWNER_ID || '', '🎮 Bot Minecraft đã online, sẵn sàng chat!')
+          } else {
+            console.log('⚠️ Không thể kết nối Facebook, tiếp tục chạy Minecraft bot')
+          }
+        }, 9000)
 
         console.log('✅ Bot setup hoàn tất và ổn định')
 
@@ -1687,85 +1705,76 @@ async function createBot() {
     equipOffhand()
   }, 15000) // Tăng lên 15 giây vì plugin tự xử lý việc ăn
 
-  // ------------------ Auto eat plugin - REMOVED (using manual eating only) ------------------
-  // setupAutoEatPlugin removed due to API incompatibility
-
-  // Backup manual eating system - LUÔN HOẠT ĐỘNG
-  function setupManualEating() {
-    console.log('🍽️ Khởi tạo Manual Eating System - Luôn hoạt động!')
-
-    setInterval(() => {
-      // Không check autoEatPluginActive nữa - luôn chạy
-      if (isEating) return // Chỉ skip nếu đang ăn
-
-      const food = bot.food
-      
-      // Chat cảnh báo khi đói < 2 đùi (4 food points)
-      if (food < 4 && food > 0) {
-        const currentTime = Date.now()
-        // Chỉ chat 1 lần mỗi 30 giây để tránh spam
-        if (currentTime - lastEatTime > 30000) {
-          bot.chat('🥺 Đói dthương nhé')
-          lastEatTime = currentTime
-        }
-      }
-      
-      // Chỉ ăn khi đói < 6 (3 đùi) VÀ không đang thực hiện hành động nào
-      if (food < 6) {
-        // Kiểm tra xem bot có đang thực hiện hành động không
-        const isIdle = !isFollowing && 
-                       !isProtecting && 
-                       !autoFarmActive && 
-                       !autoFishingActive && 
-                       !autoMiningActive && 
-                       !autoCropFarmerActive && 
-                       !autoChestHuntingActive &&
-                       !pvpActive
-        
-        // Chỉ ăn khi IDLE (không làm gì)
-        if (isIdle) {
-          const safeFood = bot.inventory.items().find(item => {
-            const name = item.name.toLowerCase()
-            const safeItems = [
-              'bread', 'apple', 'cooked_beef', 'cooked_pork', 'cooked_chicken',
-              'cooked_salmon', 'cooked_cod', 'baked_potato', 'carrot',
-              'golden_apple', 'enchanted_golden_apple', 'cooked_mutton',
-              'cookie', 'melon_slice', 'sweet_berries'
-            ]
-            return safeItems.some(safe => name.includes(safe))
-          })
-
-          if (safeFood) {
-            isEating = true
-            console.log(`🍞 Manual eating (IDLE mode): ${safeFood.name}`)
-
-            bot.equip(safeFood, 'hand').then(() => {
-              bot.consume().then(() => {
-                console.log(`✅ Đã ăn ${safeFood.name}`)
-                isEating = false
-              }).catch(() => {
-                isEating = false
-              })
-            }).catch(() => {
-              isEating = false
-            })
-          } else if (food < 6) {
-            // Không có đồ ăn và đang đói - chat cảnh báo
-            const currentTime = Date.now()
-            // Chỉ chat 1 lần mỗi 60 giây để tránh spam
-            if (currentTime - lastEatTime > 60000) {
-              bot.chat('🥺 Không có đồ ăn trong túi, đói quá!')
-              console.log('⚠️ Không có đồ ăn an toàn trong inventory!')
-              lastEatTime = currentTime
-            }
-          }
-        } else {
-          // Đang thực hiện hành động - không ăn
-          // console.log('⏸️ Đang bận, không ăn')
-        }
-      }
-    }, 3000) // Check mỗi 3 giây
+  // ------------------ Chat & eating helpers ------------------
+  // new logic based on user request: no automatic eating unless commanded
+  // safeChat wraps bot.chat so it respects the "chatEnabled" flag
+  function safeChat(message: string) {
+    if (chatEnabled) {
+      try {
+        bot.chat(message)
+      } catch {}
+    }
   }
+
+  function startAutoEatMode() {
+    if (!bot) return
+    // load plugin lazily if not already
+    if (!bot.autoEat) {
+      try {
+        bot.loadPlugin(autoEat)
+        console.log('🍽️ Auto eat plugin loaded on demand')
+      } catch (e) {
+        console.log('⚠️ Không thể tải auto-eat plugin:', e)
+      }
+    }
+    if (bot.autoEat) {
+      bot.autoEat.options = {
+        priority: 'foodPoints',
+        bannedFood: ['spider_eye', 'pufferfish']
+      }
+      bot.autoEat.enable()
+      autoEatModeActive = true
+      safeChat('🍽️ Auto eat bật – tớ sẽ ăn mọi thứ trừ mắt nhện và cá nóc.')
+    }
+    // keep interval running so we can stop later
+    if (!autoEatInterval) {
+      autoEatInterval = setInterval(() => {
+        if (!autoEatModeActive && autoEatInterval) {
+          clearInterval(autoEatInterval)
+          autoEatInterval = null
+        }
+      }, 5000)
+    }
+  }
+
+  function stopAutoEatMode() {
+    if (bot.autoEat && bot.autoEat.isEnabled && bot.autoEat.isEnabled()) {
+      bot.autoEat.disable()
+    }
+    autoEatModeActive = false
+    if (autoEatInterval) {
+      clearInterval(autoEatInterval)
+      autoEatInterval = null
+    }
+    safeChat('🍽️ Đã tắt auto eat.')
+  }
+
+  // monitor hunger for chat alert; does not eat
+  function monitorHunger() {
+    setInterval(() => {
+      if (!bot || typeof bot.food === 'undefined') return
+      const food = bot.food
+      if (food < 6) {
+        if (!hungerAlertSent) {
+          safeChat('em đói')
+          hungerAlertSent = true
+        }
+      } else {
+        hungerAlertSent = false
+      }
+    }, 5000)
+  }
+      
 
   // disableAutoEatPlugin removed - not needed
 
@@ -3651,6 +3660,16 @@ async function createBot() {
     if (autoMiningActive) stopAutoMining()
     if (autoChestHuntingActive) stopAutoChestHunting()
 
+    // ensure we know /tp permission before we start any combat logic
+    if (hasTpPermission === null) {
+      console.log('🔍 Kiểm tra quyền /tp trước khi PVP...')
+      await checkTpPermissionOnce() // existing helper on top-level
+    }
+    if (hasTpPermission === false) {
+      bot.chat('⚠️ Tớ không có quyền /tp nhưng vẫn sẽ cố gắng đuổi theo bạn!')
+      console.log('⚠️ No /tp permission, PVP will proceed without teleporting.')
+    }
+
     // Validate player name trước khi bắt đầu PVP
     const allPlayers = Object.keys(bot.players)
     console.log(`📋 Kiểm tra player "${targetName}" trong danh sách: [${allPlayers.join(', ')}]`)
@@ -4632,6 +4651,18 @@ Chỉ trả về JSON, không giải thích thêm.`
         startSmartAutoFishing()
       } else if (cleanMessage.includes('dừng câu') || cleanMessage.includes('stop fishing')) {
         stopSmartAutoFishing()
+      } else if (cleanMessage.includes('auto eat') || cleanMessage.includes('auto ăn')) {
+        // Turn on auto eat mode
+        startAutoEatMode()
+      } else if (cleanMessage === 'off' || cleanMessage === 'tắt chat') {
+        // Silence bot chat completely
+        chatEnabled = false
+        console.log('🤫 Chat đã tắt - bot sẽ im lặng trong mọi hành động')
+      } else if (cleanMessage === 'on' || cleanMessage === 'bật chat') {
+        // Re-enable bot chat
+        chatEnabled = true
+        bot.chat('💬 Chat đã bật - tớ sẽ nói chuyện như bình thường!')
+        console.log('💬 Chat enabled')
       } else if (cleanMessage.includes('auto mine') || cleanMessage.includes('auto đào')) {
         // Parse ore type from command
         const oreMatch = cleanMessage.match(/(?:auto mine|auto đào)\s+(\w+)/)
@@ -8247,11 +8278,21 @@ Trả lời câu hỏi:
 
   bot.on('end', (reason: string) => {
     console.log('💔 Bot đã ngắt kết nối:', reason || 'Unknown reason')
+    if (pvpActive) {
+      console.log('🔴 Bot đang ở chế độ PVP khi mất kết nối - có thể do server chống gian lận hoặc spam hành vi')
+    }
+
+    // Ensure PVP state is cleared so we don't resume mistakenly
+    pvpActive = false
+    if (pvpInterval) {
+      clearInterval(pvpInterval)
+      pvpInterval = null
+    }
 
     // Graceful cleanup - catch any errors
     try {
       // Clear all activities when disconnected
-  if (autoFarmActive) stopAutoFarm()
+      if (autoFarmActive) stopAutoFarm()
       autoFishingActive = false
       if (typeof autoMiningActive !== 'undefined') {
         autoMiningActive = false

@@ -11,6 +11,9 @@ pnpm-debug.log*
 .env.local
 .env.*.local
 
+# Facebook credentials (appstate)
+appstate.json
+
 # Build outputs
 dist/
 build/
